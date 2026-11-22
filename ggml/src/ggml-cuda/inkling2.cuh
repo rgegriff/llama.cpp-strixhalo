@@ -17,6 +17,7 @@ enum ggml_cuda_inkling2_fusion {
     GGML_CUDA_INKLING2_CONV_DYN,   // CONV_STATE with per-head input-dependent taps     : full-attention K/V conv
     GGML_CUDA_INKLING2_CTRL_NORM,  // RMS_NORM RMS_NORM CONCAT                          : controller input, large batches
     GGML_CUDA_INKLING2_CTRL_TAIL,  // TANH MUL SUB TANH MUL ADD                         : controller output, large batches
+    GGML_CUDA_INKLING2_TABLE,      // PAD MUL_MAT SUB                                   : compact relative-position bias table
 };
 
 struct ggml_cuda_inkling2_args {

@@ -2109,6 +2109,103 @@ static void inkling2_relbias(ggml_backend_cuda_context & ctx, const ggml_cuda_in
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// TABLE: the compact relative-position bias table of a layer, the indexed bias of FLASH_ATTN_EXT:
+//   y[b, h, t] = <W[:, b], r[:, h, t]> - s[h, t] for the n_ext bins of W, y[b, h, t] = -s[h, t] for the padded bins
+// replaces PAD MUL_MAT SUB. The unfused graph pads W on every evaluation and runs the n_rel-wide (16) product
+// through cuBLAS/rocBLAS sgemm, a library call for 0.4 MB of work per token. The sum here is in index order, so the
+// result differs from the library's in the last bits (as for the MIX kernel).
+
+static constexpr int INKLING2_TABLE_MAX_REL = 64;
+
+static __global__ void inkling2_table_f32(const float * w_ptr, const float * r_ptr, const float * s_ptr, float * dst_ptr,
+        const int n_rel, const int n_ext, const int n_bins, const int64_t n_el, const int64_t w_s1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    if (i >= n_el) {
+        return;
+    }
+    const int     b = i % n_bins; // bin
+    const int64_t c = i / n_bins; // head and token
+
+    float sum = 0.0f;
+    if (b < n_ext) {
+        const float * w = w_ptr + b*w_s1;
+        const float * r = r_ptr + c*n_rel;
+        for (int k = 0; k < n_rel; ++k) {
+            sum += w[k]*r[k];
+        }
+    }
+    dst_ptr[i] = sum - s_ptr[c];
+}
+
+static bool inkling2_match_table(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_SUB }, { i + 2 }) ||
+            !ggml_check_edges(cgraph, i, { {1, 0, 0}, {2, 0, 1} })) {
+        return false;
+    }
+
+    ggml_tensor * const * nodes = cgraph->nodes + i;
+
+    const ggml_tensor * pad = nodes[0];
+    const ggml_tensor * w   = pad->src[0];
+    const ggml_tensor * r   = nodes[1]->src[1];
+    const ggml_tensor * s   = nodes[2]->src[1];
+    ggml_tensor       * dst = nodes[2];
+
+    // zero bins after the last one only
+    for (int p = 0; p < 9; ++p) {
+        if (p != 3 && ggml_get_op_params_i32(pad, p) != 0) {
+            return false;
+        }
+    }
+    if (ggml_get_op_params_i32(pad, 3) < 0) {
+        return false;
+    }
+
+    if (!inkling2_is_f32_rows(w) || w->ne[2] != 1 || w->ne[3] != 1 || w->ne[0] > INKLING2_TABLE_MAX_REL ||
+            pad->ne[0] != w->ne[0] || pad->ne[1] != w->ne[1] + ggml_get_op_params_i32(pad, 3) || pad->ne[1] > INT_MAX) {
+        return false;
+    }
+    if (r->type != GGML_TYPE_F32 || !ggml_is_contiguous(r) || r->ne[0] != w->ne[0] || r->ne[3] != 1 ||
+            s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) || s->ne[0] != 1 || s->ne[1] != r->ne[1] ||
+            s->ne[2] != r->ne[2] || s->ne[3] != 1) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != pad->ne[1] || dst->ne[1] != r->ne[1] ||
+            dst->ne[2] != r->ne[2] || dst->ne[3] != 1) {
+        return false;
+    }
+    // every thread reads W, r and s and writes one element of dst: none of them may be where dst is
+    if (inkling2_overlap(dst, w) || inkling2_overlap(dst, r) || inkling2_overlap(dst, s) ||
+            !inkling2_outside(cgraph, i, 3, { w, r, s })) {
+        return false;
+    }
+
+    args.type    = GGML_CUDA_INKLING2_TABLE;
+    args.n_nodes = 3;
+    args.dst     = dst;
+    args.src[0]  = w;
+    args.src[1]  = r;
+    args.src[2]  = s;
+    return true;
+}
+
+static void inkling2_table(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_args & args) {
+    const ggml_tensor * w = args.src[0];
+    const ggml_tensor * r = args.src[1];
+    const ggml_tensor * s = args.src[2];
+
+    const int64_t n_el = ggml_nelements(args.dst);
+    const int     bs   = 256;
+
+    const ggml_cuda_kernel_launch_params params(dim3((n_el + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(inkling2_table_f32, params, (const float *) w->data, (const float *) r->data,
+            (const float *) s->data, (float *) args.dst->data, (int) w->ne[0], (int) w->ne[1], (int) args.dst->ne[0], n_el,
+            (int64_t) (w->nb[1]/sizeof(float)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 
 bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
     args = {};
@@ -2133,6 +2230,8 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
             return inkling2_match_relbias(cgraph, i, args);
         case GGML_OP_CONCAT:
             return inkling2_match_conv_state(cgraph, i, args) || inkling2_match_conv_dyn(cgraph, i, args);
+        case GGML_OP_PAD:
+            return inkling2_match_table(cgraph, i, args);
         default:
             return false;
     }
@@ -2151,6 +2250,7 @@ void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_i
         case GGML_CUDA_INKLING2_CTRL_NORM:  inkling2_ctrl_norm(ctx, args);  break;
         case GGML_CUDA_INKLING2_CTRL_TAIL:  inkling2_ctrl_tail(ctx, args);  break;
         case GGML_CUDA_INKLING2_RELBIAS:    inkling2_relbias(ctx, args);    break;
+        case GGML_CUDA_INKLING2_TABLE:      inkling2_table(ctx, args);      break;
         default: GGML_ABORT("fatal error");
     }
 }

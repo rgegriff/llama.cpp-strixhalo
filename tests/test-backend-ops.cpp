@@ -3909,14 +3909,15 @@ struct test_softcap : public test_case {
 // Inkling 2: the glue op chains of src/models/inkling2.cpp, built in the same op order as the model, so that a
 // backend that fuses them (CUDA, inkling2.cu) is compared against the unfused CPU ops
 struct test_inkling2 : public test_case {
-    enum chain_type { CLIP, CONV, SITU, MIX, CTRL, RELBIAS, CONV_STATE, CONV_DYN };
+    enum chain_type { CLIP, CONV, SITU, MIX, CTRL, RELBIAS, CONV_STATE, CONV_DYN, TABLE };
 
     const chain_type chain;
     const int64_t    n;     // channels
     const int64_t    n_tok; // tokens
     const int64_t    k;     // CLIP: heads, CONV(_STATE, _DYN): sequences, SITU: experts used, MIX: states,
-                            // CTRL: gate rank, RELBIAS: heads
+                            // CTRL: gate rank, RELBIAS and TABLE: heads
     const int64_t    v;     // CLIP: has a scale, SITU: gathers the scale by expert id, MIX: queries, RELBIAS: n_kv,
+                            // TABLE: bins of the bias (the relative extent),
                             // CONV_DYN: heads, CONV(_STATE): a residual add follows
 
     ggml_tensor * state_store = nullptr; // CONV_STATE: the state store, compared along with the output
@@ -3926,7 +3927,7 @@ struct test_inkling2 : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         static const char * names[] = { "INKLING2_CLIP", "INKLING2_CONV", "INKLING2_SITU", "INKLING2_MIX", "INKLING2_CTRL",
-            "INKLING2_RELBIAS", "INKLING2_CONV_STATE", "INKLING2_CONV_DYN" };
+            "INKLING2_RELBIAS", "INKLING2_CONV_STATE", "INKLING2_CONV_DYN", "INKLING2_TABLE" };
         return names[chain];
     }
 
@@ -3946,8 +3947,8 @@ struct test_inkling2 : public test_case {
     ggml_tensor * out_node = nullptr;
 
     double max_nmse_err() override {
-        // MIX, CTRL and RELBIAS contain matrix multiplications, the tolerance of test_mul_mat
-        return chain == MIX || chain == CTRL || chain == RELBIAS ? 5e-4 : 1e-6;
+        // MIX, CTRL, RELBIAS and TABLE contain matrix multiplications, the tolerance of test_mul_mat
+        return chain == MIX || chain == CTRL || chain == RELBIAS || chain == TABLE ? 5e-4 : 1e-6;
     }
 
     test_inkling2(chain_type chain, int64_t n, int64_t n_tok, int64_t k, int64_t v)
@@ -4071,6 +4072,18 @@ struct test_inkling2 : public test_case {
                 kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
                 out = ggml_add(ctx, kq_b, ggml_cast(ctx, mask, GGML_TYPE_F32));
                 out = ggml_cast(ctx, out, GGML_TYPE_F16);
+            } break;
+            case TABLE: {
+                // the compact bias table of the indexed-bias flash attention: one zero bin after the extent, minus the sinks
+                const int64_t n_rel  = n;
+                const int64_t n_head = k;
+                const int64_t n_ext  = v;
+                ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_ext);
+                ggml_tensor * r     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tok);
+                ggml_tensor * sinks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_head, n_tok);
+                ggml_set_name(w, "w");
+                ggml_set_name(r, "r");
+                out = ggml_sub(ctx, ggml_mul_mat(ctx, ggml_pad(ctx, w, 0, 1, 0, 0), r), sinks);
             } break;
             case CONV_STATE:
             case CONV_DYN: {
@@ -12401,6 +12414,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2(test_inkling2::CTRL, 2304, n_tok, 64, 0));
         test_cases.emplace_back(new test_inkling2(test_inkling2::RELBIAS, 16, n_tok, 24, 256));
         test_cases.emplace_back(new test_inkling2(test_inkling2::RELBIAS, 16, n_tok, 24, 1024 + n_tok));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::TABLE, 16, n_tok, 24, 1024));
     }
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, 1, 1, 0));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, 1, 1, 1));
@@ -12415,6 +12429,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 256, 3, 4, 0));
     test_cases.emplace_back(new test_inkling2(test_inkling2::MIX,  96, 3, 3, 2));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CTRL, 96, 3, 8, 0));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::TABLE, 16, 3, 6, 64));
     // end of Inkling 2 glue chains
     test_cases.emplace_back(new test_silu_back());
     test_cases.emplace_back(new test_sigmoid_back());
