@@ -3305,6 +3305,109 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// GGML_CUDA_OP_STATS=1: count the ops that the graph evaluations dispatch and the nodes that the fusions replace, and
+// print the totals when the process exits. A dispatched op is at least one kernel launch (most are exactly one), so
+// for the graphs of many small ops (Inkling 2 decode) this is the launch count that the fusions are there to cut.
+// GGML_CUDA_OP_STATS=2 also synchronizes the stream after every dispatch and adds up the wall time per kind of op
+// (MUL_MAT by the type and shape of its operands): a profile that needs no external tool. The synchronization
+// serializes the CPU and the GPU, so the times of the smallest ops are upper bounds and the total is more than the
+// time of an evaluation without it; compare the totals to know by how much.
+struct ggml_cuda_op_stats {
+    const int  level   = [] { const char * env = getenv("GGML_CUDA_OP_STATS"); return env ? atoi(env) : 0; }();
+    const bool enabled = level > 0;
+    const bool timing  = level > 1;
+
+    struct entry {
+        uint64_t count    = 0;
+        uint64_t replaced = 0; // fused chains: the ops they stand for
+        int64_t  t_us     = 0;
+    };
+
+    std::mutex mutex;
+    uint64_t   n_graphs = 0;
+    std::map<std::string, entry> ops;
+    std::map<std::string, entry> fused; // by the first op and the length of the chain
+
+    static std::string shape(const ggml_tensor * t) {
+        std::string s = ggml_type_name(t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (d == 0 || t->ne[d] != 1) {
+                s += (d == 0 ? " " : "x") + std::to_string(t->ne[d]);
+            }
+        }
+        return s;
+    }
+
+    std::string key(const ggml_tensor * node) const {
+        std::string k = ggml_op_desc(node);
+        if (timing && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_FLASH_ATTN_EXT)) {
+            k += " [" + shape(node->src[0]) + "] [" + shape(node->src[1]) + "]";
+        }
+        return k;
+    }
+
+    void add_op(const ggml_tensor * node, int64_t t_us) {
+        std::lock_guard<std::mutex> lock(mutex);
+        entry & e = ops[key(node)];
+        e.count++;
+        e.t_us += t_us;
+    }
+
+    void add_fused(const ggml_cgraph * cgraph, int i, int nodes_to_skip, int64_t t_us) {
+        uint64_t n_ops = 0;
+        for (int k = i; k <= i + nodes_to_skip; ++k) {
+            n_ops += !ggml_cuda_is_view_or_noop(cgraph->nodes[k]);
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        entry & e = fused[std::string(ggml_op_desc(cgraph->nodes[i])) + "+" + std::to_string(nodes_to_skip)];
+        e.count++;
+        e.replaced += n_ops;
+        e.t_us += t_us;
+    }
+
+    ~ggml_cuda_op_stats() {
+        if (!enabled || n_graphs == 0) {
+            return;
+        }
+        entry total_ops, total_fused;
+        for (const auto & [name, e] : ops) {
+            total_ops.count += e.count;
+            total_ops.t_us  += e.t_us;
+        }
+        for (const auto & [name, e] : fused) {
+            total_fused.count    += e.count;
+            total_fused.replaced += e.replaced;
+            total_fused.t_us     += e.t_us;
+        }
+        const double n = double(n_graphs);
+        fprintf(stderr, "ggml_cuda_op_stats: %" PRIu64 " graph evaluations, per evaluation: %.1f dispatches (%.1f unfused ops + %.1f fused chains that replace %.1f ops)\n",
+                n_graphs, (total_ops.count + total_fused.count)/n, total_ops.count/n, total_fused.count/n, total_fused.replaced/n);
+        if (timing) {
+            fprintf(stderr, "ggml_cuda_op_stats: synchronized time per evaluation: %.3f ms (%.3f ms unfused ops + %.3f ms fused chains)\n",
+                    (total_ops.t_us + total_fused.t_us)/n/1000.0, total_ops.t_us/n/1000.0, total_fused.t_us/n/1000.0);
+        }
+        for (const auto & [name, e] : ops) {
+            fprintf(stderr, "ggml_cuda_op_stats:   op    %-64s %9.1f", name.c_str(), e.count/n);
+            if (timing) {
+                fprintf(stderr, " %10.3f ms %8.2f us each", e.t_us/n/1000.0, double(e.t_us)/e.count);
+            }
+            fprintf(stderr, "\n");
+        }
+        for (const auto & [name, e] : fused) {
+            fprintf(stderr, "ggml_cuda_op_stats:   fused %-64s %9.1f", name.c_str(), e.count/n);
+            if (timing) {
+                fprintf(stderr, " %10.3f ms %8.2f us each", e.t_us/n/1000.0, double(e.t_us)/e.count);
+            }
+            fprintf(stderr, "  (replaces %.1f ops)\n", e.replaced/n);
+        }
+    }
+};
+
+static ggml_cuda_op_stats & ggml_cuda_get_op_stats() {
+    static ggml_cuda_op_stats stats;
+    return stats;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
@@ -4525,7 +4628,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+    // GGML_CUDA_INKLING2_FUSION=0 turns off the Inkling 2 chains only, for A/B measurements
+    static const bool inkling2_fusion = [] {
+        const char * env = getenv("GGML_CUDA_INKLING2_FUSION");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    if (inkling2_fusion && cuda_ctx->stream_context().concurrent_events.empty()) {
         ggml_cuda_inkling2_args inkling2;
         if (ggml_cuda_inkling2_match(cgraph, i, inkling2)) {
             ggml_cuda_inkling2_fused(*cuda_ctx, inkling2);
@@ -5410,6 +5519,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+            if (ggml_cuda_get_op_stats().enabled) {
+                std::lock_guard<std::mutex> lock(ggml_cuda_get_op_stats().mutex);
+                ggml_cuda_get_op_stats().n_graphs++;
+            }
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
@@ -5525,9 +5638,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_op_stats & op_stats = ggml_cuda_get_op_stats();
+                const int64_t t_op_start = op_stats.timing ? ggml_time_us() : 0;
+                // the wall time of the dispatch that started at t_op_start, with everything it launched done
+                const auto op_time_us = [&]() -> int64_t {
+                    if (!op_stats.timing) {
+                        return 0;
+                    }
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    return ggml_time_us() - t_op_start;
+                };
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (op_stats.enabled) {
+                        op_stats.add_fused(cgraph, i, nodes_to_skip, op_time_us());
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5559,6 +5686,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (op_stats.enabled) {
+                    op_stats.add_op(node, op_time_us());
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
