@@ -33,6 +33,12 @@ struct fattn_indexed_bias {
         const int bin = indices[query*n_keys + key];
         return uint32_t(bin) < n_bins ? __float2half(__half2float(mask) + table[query*query_stride + bin]) : mask;
     }
+
+    // the bias of the head that is head_offset after the head of for_head(): the heads of a query share its indices
+    __device__ half add_head(half mask, int query, int key, int head_offset) const {
+        const int bin = indices[query*n_keys + key];
+        return uint32_t(bin) < n_bins ? __float2half(__half2float(mask) + table[query*query_stride + head_offset*n_bins + bin]) : mask;
+    }
 };
 
 typedef void (* fattn_kernel_t)(
