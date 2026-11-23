@@ -1,6 +1,43 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+
+namespace {
+// the orthonormal Sylvester Hadamard matrix, H = H^T = H^-1, uploaded with every evaluation (64 KiB)
+struct llm_graph_input_inkling2_rot : public llm_graph_input_i {
+    ggml_tensor * h = nullptr;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        const int64_t n = h->ne[0];
+        const float   s = 1.0f/sqrtf(float(n));
+        std::vector<float> d(n*n);
+        for (int64_t i = 0; i < n; ++i) {
+            for (int64_t j = 0; j < n; ++j) {
+                d[i*n + j] = (__builtin_popcountll(uint64_t(i & j)) & 1) ? -s : s;
+            }
+        }
+        ggml_backend_tensor_set(h, d.data(), 0, ggml_nbytes(h));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+};
+
+// LLAMA_INKLING_KV_ROT (experiment): bit 1 rotates each head's Q and K, bit 2 its V, by H before they
+// reach the cache, so that a coarse K/V cache type sees no outlier channels. Q K^T is unchanged; the attention output
+// is rotated back by H right after the attention.
+int inkling2_kv_rot_mode() {
+    static const int mode = [] { const char * e = getenv("LLAMA_INKLING_KV_ROT"); return e ? atoi(e) : 0; }();
+    return mode;
+}
+} // namespace
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -387,6 +424,24 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             Rcur = ggml_mul(ctx0, Rcur, tau);
         }
 
+        const int kv_rot_mode = n_embd_head == 128 ? inkling2_kv_rot_mode() : 0;
+        if (kv_rot_mode) {
+            if (!kv_rot) {
+                auto rot = std::make_unique<llm_graph_input_inkling2_rot>();
+                kv_rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_head, n_embd_head);
+                ggml_set_input(kv_rot);
+                rot->h = kv_rot;
+                res->add_input(std::move(rot));
+            }
+            if (kv_rot_mode & 1) {
+                Qcur = ggml_mul_mat(ctx0, kv_rot, Qcur);
+                Kcur = ggml_mul_mat(ctx0, kv_rot, Kcur);
+            }
+            if (kv_rot_mode & 2) {
+                Vcur = ggml_mul_mat(ctx0, kv_rot, Vcur);
+            }
+        }
+
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
@@ -408,6 +463,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
+
+        if (kv_rot_mode & 2) {
+            cur = ggml_mul_mat(ctx0, kv_rot, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens));
+            cur = ggml_reshape_2d(ctx0, cur, n_embd_head*n_head, n_tokens);
+        }
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

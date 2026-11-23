@@ -2578,6 +2578,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * kv_rot      = nullptr; // LLAMA_INKLING_KV_ROT: the 128x128 Hadamard rotation of Q, K, V
 
     private:
         // the normalized depth states of blocks[0, n), latest first, shared by every mix over the same blocks
