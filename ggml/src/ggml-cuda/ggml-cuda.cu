@@ -5740,6 +5740,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
             }
             graph->disable_due_to_gpu_arch = true;
         }
+        // GGML_CUDA_OP_STATS=2 synchronizes after every dispatch, which a stream capture does not allow
+        if (ggml_cuda_get_op_stats().timing) {
+            graph->disable_due_to_gpu_arch = true;
+        }
     }
 
     return graph->is_enabled();

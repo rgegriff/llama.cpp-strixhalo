@@ -64,8 +64,8 @@ need_ram() { # need_ram <GiB> <what>
 
 need_slot() {
     [ "${GPU_SLOT:-0}" = 1 ] || die "the GPU is booked by default. Run with GPU_SLOT=1 only once the slot is yours."
-    if ss -ltn 2>/dev/null | grep -q ':8291 ' && [ "${FORCE:-0}" != 1 ]; then
-        die "something listens on :8291 (the Inkling server). Its batch owns the GPU; FORCE=1 only if you were told it is idle."
+    if ss -ltn 2>/dev/null | grep -qE ':(8291|8293) ' && [ "${FORCE:-0}" != 1 ]; then
+        die "something listens on :8291 or :8293 (an Inkling server). Its batch owns the GPU; FORCE=1 only if you were told it is idle."
     fi
     mkdir -p "$OUT"
 }

@@ -9738,6 +9738,14 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
+        if (getenv("FA_PERF_INDEXED_BIAS") && mask && mask_heads == 1 && nr23[1] == 1 && n_kv_max == 0) {
+            // Inkling 2: a per-head bias table indexed per KV position (the path the GQA decode kernel needs)
+            ggml_tensor * btab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, q->ne[2], q->ne[1]*q->ne[3]);
+            ggml_set_name(btab, "btab");
+            ggml_tensor * bidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
+            ggml_set_name(bidx, "bidx");
+            ggml_flash_attn_ext_add_indexed_bias(out, btab, bidx);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9768,6 +9776,12 @@ struct test_flash_attn_ext : public test_case {
                 } else {
                     init_tensor_kq_mask(t);
                 }
+            } else if (strcmp(t->name, "bidx") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = int32_t((i*7) % 64);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -14967,6 +14981,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Inkling 2 Mini full-attention decode: D=128, 8 KV heads x 3 query heads, one token, long KV.
+    for (int kv : { 32768, 131072, 262144 }) {
+        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
