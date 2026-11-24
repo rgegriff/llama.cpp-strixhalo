@@ -8,3 +8,7 @@ synth/
 fa_decode2
 fa-prefill/fa_prefill
 fa-prefill/wmma_probe
+fa-prefill/fa_prefill_*
+fa-prefill/fa_abl_*
+fa-prefill/wmma_probe2
+fa-prefill/wmma_peak

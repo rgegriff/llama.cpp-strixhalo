@@ -34,9 +34,21 @@
 constexpr int D = 128, HKV = 8, G = 3, HQ = HKV*G, WAVE = 32;
 constexpr int KT = 64;                    // keys per LDS tile (one softmax step)
 constexpr int NSUB = KT/16;               // 16-key WMMA sub-tiles per tile
-constexpr int K_LD16 = D*2/16 + 1;        // K row in LDS: 17 x 16 B (padded against bank conflicts)
-constexpr int V_LD16 = KT*2/16 + 1;       // V^T row in LDS: 9 x 16 B
+// LDS tile layout: FA_PAD=1 pads each row by 16 B against bank conflicts (35 KB per tile set, single-buffered);
+// FA_PAD=0 keeps rows unpadded and XOR-swizzles their 16 B chunks instead (32 KB), which allows FA_DBUF=1: two buffers in
+// exactly 64 KB and one barrier per tile. Measured (kv 65536, qt 128, 2 splits): PAD=1 24-25.6 ms, PAD=0 single 30-32 ms,
+// PAD=0 double-buffered 30-36 ms, so the padding wins and the double buffer is kept only as a documented experiment.
+#ifndef FA_PAD
+#define FA_PAD 1
+#endif
+#ifndef FA_DBUF
+#define FA_DBUF 0
+#endif
+constexpr int K_LD16 = D*2/16 + FA_PAD;   // K row in LDS: 16 (+1) x 16 B
+constexpr int V_LD16 = KT*2/16 + FA_PAD;  // V^T row in LDS: 8 (+1) x 16 B
 constexpr int LDS_K = KT*K_LD16, LDS_V = D*V_LD16;   // in uint4
+constexpr int NBUF = (FA_DBUF && !FA_PAD) ? 2 : 1;
+static_assert(NBUF*(LDS_K + LDS_V)*16 <= 65536, "LDS");
 #ifndef FA_LOOKAHEAD
 #define FA_LOOKAHEAD 2
 #endif
@@ -46,6 +58,19 @@ constexpr int LDS_K = KT*K_LD16, LDS_V = D*V_LD16;   // in uint4
 #ifndef FA_SCHED
 #define FA_SCHED 1
 #endif
+// ablations for timing experiments only (results are wrong): drop LDS fragment reads / the WMMA op / the K,V tile traffic
+#ifndef FA_ABL_NOLDS
+#define FA_ABL_NOLDS 0
+#endif
+#ifndef FA_ABL_NOWMMA
+#define FA_ABL_NOWMMA 0
+#endif
+#ifndef FA_ABL_NOGLOBAL
+#define FA_ABL_NOGLOBAL 0
+#endif
+#ifndef FA_ABL_NOBARRIER
+#define FA_ABL_NOBARRIER 0
+#endif
 
 typedef __attribute__((ext_vector_type(16))) _Float16 halfx16;
 typedef __attribute__((ext_vector_type(8)))  float    floatx8;
@@ -53,9 +78,22 @@ typedef __attribute__((ext_vector_type(8)))  float    floatx8;
 __device__ __forceinline__ halfx16 ld_frag(const uint4 * p) {        // 32 contiguous bytes = 16 halves (one WMMA A/B operand)
     union { uint4 u[2]; halfx16 h; } r; r.u[0] = p[0]; r.u[1] = p[1]; return r.h;
 }
+// Bank-conflict avoidance without padding: a row's 16 B chunks are XOR-swizzled by an even amount, so a fragment's two
+// chunks stay adjacent. K rows (256 B): readers take 16 consecutive rows -> spread by row % 8. V^T rows (128 B): readers take
+// 16 consecutive rows, the transposing writers 16 rows 8 apart -> spread by both row % 4 and (row/8) % 4.
+// With padded rows the readers are conflict-free by the padding; only the V^T writers (rows 8 apart = 9 x 128 B) need a swizzle.
+__device__ __forceinline__ int kswz(int row) { return FA_PAD ? 0 : 2*(row % 8); }
+__device__ __forceinline__ int vswz(int row) { return FA_PAD ? (row/8) % 8 : 2*((row % 4) ^ ((row/8) % 4)); }
+__device__ __forceinline__ halfx16 ld_frag_s(const uint4 * row, int chunk, int swz) {   // chunks chunk, chunk+1 of a swizzled row
+    union { uint4 u[2]; halfx16 h; } r; r.u[0] = row[chunk ^ swz]; r.u[1] = row[(chunk + 1) ^ swz]; return r.h;
+}
 __device__ __forceinline__ floatx8 wmma(const halfx16 & a, const halfx16 & b, const floatx8 & c) {
     // D[i][j] = sum_k a_lane(i)[k] * b_lane(j)[k]; lane l holds D[2e + l/16][l%16] (probed: wmma_probe.hip)
+#if FA_ABL_NOWMMA      // ablation (timing only): keep the dependency chain, drop the matrix op
+    floatx8 r = c; r[0] += (float) a[0]*(float) b[0]; return r;
+#else
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
 }
 // ask the scheduler for: 2*LA ds_reads up front, then (1 WMMA, 2 ds_reads) x (8-LA), then LA WMMAs (one 16-key sub-tile)
 __device__ __forceinline__ void sched_pipeline() {
@@ -73,6 +111,9 @@ __device__ __forceinline__ void sched_pipeline() {
 __device__ __forceinline__ float bias_val(__half mk, int bin, const float * tbl, int n_bins) {    // fattn_indexed_bias::add
     return (uint32_t) bin < (uint32_t) n_bins ? __half2float(__float2half(__half2float(mk) + tbl[bin])) : __half2float(mk);
 }
+// value of lane^16: v_permlanex16 is a VALU op; __shfl_xor compiles to ds_bpermute, an LDS round trip on the critical path
+__device__ __forceinline__ uint32_t xchg16(uint32_t v) { return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false); }
+__device__ __forceinline__ float xchg16(float v) { return __uint_as_float(xchg16(__float_as_uint(v))); }
 __device__ __forceinline__ uint32_t pack_half2(float a, float b) {
     return (uint32_t) __half_as_ushort(__float2half(a)) | ((uint32_t) __half_as_ushort(__float2half(b)) << 16);
 }
@@ -109,8 +150,7 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
     constexpr int NVLD = (NVT + NT - 1)/NT;                          // V tasks per thread per tile
     constexpr int STEPS = FA_STEPS, SUBS = NSUB/STEPS;  // softmax steps per tile, 16-key sub-tiles per step
     constexpr int LA = QT >= 128 ? FA_LOOKAHEAD : 1;    // LDS fragments in flight ahead of the WMMA that consumes them
-    __shared__ uint4 lds[LDS_K + LDS_V];
-    uint4 * Ks = lds; uint4 * Vt = lds + LDS_K;
+    __shared__ uint4 lds[NBUF*(LDS_K + LDS_V)];
 
     const int tid = threadIdx.x, lane = tid % WAVE, w = tid / WAVE, l16 = lane % 16, hh = lane / 16;
     const int hk = blockIdx.z, split = blockIdx.y, qbase = blockIdx.x*QT;
@@ -145,12 +185,14 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
     const int n_qt = n_q/16;
     typedef typename std::conditional<QT == 32, uint16_t, typename std::conditional<QT == 64, uint32_t, uint64_t>::type>::type flagword_t;
     constexpr flagword_t ALL2 = (flagword_t) 0x0202020202020202ull;
+    auto flagword = [&](int kt) { return *(const flagword_t *) (flags + (int64_t) kt*n_qt + qbase/16); };
     flagword_t fw = 0;                     // the workgroup's QT/16 flags of the tile next_tile() returned
-    auto next_tile = [&](int kt) {
+    auto next_tile = [&](int kt, flagword_t w) {      // w = flags of kt, already loaded
         for (; kt < kt_end; ++kt) {
-            fw = *(const flagword_t *) (flags + (int64_t) kt*n_qt + qbase/16);
-            if (fw != ALL2) break;
+            if (w != ALL2) break;
+            if (kt + 1 < kt_end) w = flagword(kt + 1);
         }
+        fw = w;
         return kt;
     };
     // c < limit is the same for all lanes of a wave (NT, limit are multiples of 32): say so, or the compiler masks the
@@ -158,7 +200,10 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
     auto uni = [](int c, int limit) { return __builtin_amdgcn_readfirstlane(c) < limit; };
     uint4 pk[NKLD]; uint32_t pv[NVLD][4][4];
     __half mk_nx; int bin_nx;               // the row's mask/bin at the first key of the prefetched tile (uniform tiles)
+    flagword_t fw_nx = ALL2;                // flags of the tile after the prefetched one
     auto prefetch = [&](int kt) {        // global loads of tile kt into registers
+        if (kt + 1 < kt_end) fw_nx = flagword(kt + 1);
+        if (FA_ABL_NOGLOBAL) return;
         const int kbase = kt*KT;
         mk_nx = mrow[kbase]; bin_nx = irow[kbase];
         #pragma unroll
@@ -179,13 +224,15 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
             }
         }
     };
-    auto store_lds = [&]() {             // registers -> LDS: K as [key][d], V transposed to [d][key]
+    auto store_lds = [&](int buf) {      // registers -> LDS buffer: K as [key][d], V transposed to [d][key]
+        if (FA_ABL_NOGLOBAL) return;
+        uint4 * Ks = lds + buf*(LDS_K + LDS_V);
         #pragma unroll
         for (int i = 0; i < NKLD; ++i) {
             const int c = tid - KT0 + i*NKT, key = c/16, dc = c % 16;
-            if (uni(c, KT*16) && (!ROLES || __builtin_amdgcn_readfirstlane(tid) >= KT0)) Ks[key*K_LD16 + dc] = pk[i];
+            if (uni(c, KT*16) && (!ROLES || __builtin_amdgcn_readfirstlane(tid) >= KT0)) Ks[key*K_LD16 + (dc ^ kswz(key))] = pk[i];
         }
-        uint2 * dst = (uint2 *) Vt;
+        uint2 * dst = (uint2 *) (Ks + LDS_K);
         #pragma unroll
         for (int t = 0; t < NVLD; ++t) {
             const int c = tid + t*NT, dc = c % 16, kg = c/16;
@@ -195,22 +242,28 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
                     const uint32_t sel = (j & 1) ? 0x07060302u : 0x05040100u;
                     const uint32_t a = __builtin_amdgcn_perm(pv[t][1][j/2], pv[t][0][j/2], sel);
                     const uint32_t b = __builtin_amdgcn_perm(pv[t][3][j/2], pv[t][2][j/2], sel);
-                    dst[(dc*8 + j)*(V_LD16*2) + kg] = make_uint2(a, b);
+                    const int row = dc*8 + j, chunk = (kg/2) ^ vswz(row);
+                    dst[row*(V_LD16*2) + chunk*2 + (kg & 1)] = make_uint2(a, b);
                 }
             }
         }
     };
 
-    int kt = next_tile(kt_begin);
-    if (kt < kt_end) prefetch(kt);
+    // Pipeline per tile: [barrier] issue the next tile's global loads; compute this tile from LDS buffer `buf`; store the
+    // next tile into the other buffer (its loads had the whole compute to land). With one buffer the store needs a second
+    // barrier (everyone done reading) and happens at the top instead.
+    int kt = next_tile(kt_begin, kt_begin < kt_end ? flagword(kt_begin) : ALL2);
+    if (kt < kt_end) { prefetch(kt); if (NBUF == 2) store_lds(0); }
+    int buf = 0;
     __half mk_cur = __float2half(0.0f); int bin_cur = -1; float brow = bias_val(mk_cur, bin_cur, tbl, n_bins);
     while (kt < kt_end) {
         const int flag = (int) ((fw >> (8*(w/G))) & 0xff);
         const int kbase = kt*KT;
-        store_lds();
+        if (NBUF == 1) store_lds(0);
         const __half mk = mk_nx; const int bin = bin_nx;
-        __syncthreads();
-        const int kt_nx = next_tile(kt + 1);
+        if (!FA_ABL_NOBARRIER) __syncthreads();
+        const uint4 * Ks = lds + buf*(LDS_K + LDS_V), * Vt = Ks + LDS_K;
+        const int kt_nx = next_tile(kt + 1, fw_nx);
         if (kt_nx < kt_end) prefetch(kt_nx);          // in flight while this tile is computed
         // row-constant bias of a uniform tile: only re-gather the table when the bin or the mask changes (rare)
         if (flag == 1 && (bin != bin_cur || __half_as_ushort(mk) != __half_as_ushort(mk_cur))) {
@@ -220,20 +273,21 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
         if (flag != 2) {
             #pragma unroll 1
             for (int step = 0; step < STEPS; ++step) {
-                // S^T = K.Q^T: lane holds S[key = kbase + sub*16 + 2e + hh][q]; K fragments pipelined 4 ahead
+                // S^T = K.Q^T: lane holds S[key = kbase + sub*16 + 2e + hh][q]; K fragments pipelined LA ahead
                 floatx8 s[SUBS];
                 #pragma unroll
                 for (int ss = 0; ss < SUBS; ++ss) {
                     const int sub = step*SUBS + ss;
                     const uint4 * kp = Ks + (sub*16 + l16)*K_LD16;
+                    const int ksw = kswz(l16);                       // row sub*16 + l16
                     halfx16 kf[LA];
                     #pragma unroll
-                    for (int i = 0; i < LA; ++i) kf[i] = ld_frag(kp + 2*i);
+                    for (int i = 0; i < LA; ++i) kf[i] = FA_ABL_NOLDS ? Qb[i] : ld_frag_s(kp, 2*i, ksw);
                     floatx8 c = (floatx8) {0, 0, 0, 0, 0, 0, 0, 0};
                     #pragma unroll
                     for (int dt = 0; dt < D/16; ++dt) {
                         const halfx16 a = kf[dt % LA];
-                        if (dt + LA < D/16) kf[dt % LA] = ld_frag(kp + 2*(dt + LA));
+                        if (dt + LA < D/16) kf[dt % LA] = FA_ABL_NOLDS ? Qb[dt + LA] : ld_frag_s(kp, 2*(dt + LA), ksw);
                         c = wmma(a, Qb[dt], c);
                     }
                     sched_pipeline();
@@ -259,8 +313,8 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
                 for (int ss = 0; ss < SUBS; ++ss)
                     #pragma unroll
                     for (int e = 0; e < 8; ++e) mt = fmaxf(mt, s[ss][e]);
-                mt = fmaxf(mt, __shfl_xor(mt, 16));
-                const float mn = fmaxf(m, mt), alpha = __expf(m - mn);
+                mt = fmaxf(mt, xchg16(mt));
+                const float m_old = m, mn = fmaxf(m, mt), alpha = __expf(m - mn);
                 m = mn;
                 float ps = 0.0f;
                 #pragma unroll
@@ -268,8 +322,10 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
                     #pragma unroll
                     for (int e = 0; e < 8; ++e) { const float p = __expf(s[ss][e] - mn); s[ss][e] = p; ps += p; }
                 l = l*alpha + ps;
-                #pragma unroll
-                for (int dt = 0; dt < D/16; ++dt) O[dt] *= alpha;
+                if (__builtin_amdgcn_ballot_w32(mn != m_old)) {           // wave-uniform: usually false far from the diagonal
+                    #pragma unroll
+                    for (int dt = 0; dt < D/16; ++dt) O[dt] *= alpha;
+                }
 
                 // P as WMMA B operands, then O^T += V^T.P^T (lane holds O[d = dt*16 + 2e + hh][q]); V fragments pipelined
                 #pragma unroll
@@ -279,7 +335,7 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
                     #pragma unroll
                     for (int e2 = 0; e2 < 4; ++e2) x[e2] = pack_half2(s[ss][2*e2], s[ss][2*e2 + 1]);
                     #pragma unroll
-                    for (int e2 = 0; e2 < 4; ++e2) y[e2] = __shfl_xor(x[e2], 16);
+                    for (int e2 = 0; e2 < 4; ++e2) y[e2] = xchg16(x[e2]);
                     union { uint32_t u[8]; halfx16 h; } r;
                     #pragma unroll
                     for (int e2 = 0; e2 < 4; ++e2) {
@@ -288,25 +344,26 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
                         r.u[2*e2 + 1] = (a >> 16) | (b & 0xffff0000u);
                     }
                     const halfx16 Pb = r.h;
-                    const uint4 * vp = Vt + l16*V_LD16 + 2*sub;
+                    const uint4 * vp = Vt + l16*V_LD16;            // rows dt*16 + l16
                     halfx16 vf[LA];
                     #pragma unroll
-                    for (int i = 0; i < LA; ++i) vf[i] = ld_frag(vp + i*16*V_LD16);
+                    for (int i = 0; i < LA; ++i) vf[i] = FA_ABL_NOLDS ? Qb[i] : ld_frag_s(vp + i*16*V_LD16, 2*sub, vswz(i*16 + l16));
                     #pragma unroll
                     for (int dt = 0; dt < D/16; ++dt) {
                         const halfx16 a = vf[dt % LA];
-                        if (dt + LA < D/16) vf[dt % LA] = ld_frag(vp + (dt + LA)*16*V_LD16);
+                        if (dt + LA < D/16) vf[dt % LA] = FA_ABL_NOLDS ? Qb[dt + LA] : ld_frag_s(vp + (dt + LA)*16*V_LD16, 2*sub, vswz((dt + LA)*16 + l16));
                         O[dt] = wmma(a, Pb, O[dt]);
                     }
                     sched_pipeline();
                 }
             }
         }
-        __syncthreads();
+        if (NBUF == 2) { if (kt_nx < kt_end) store_lds(buf ^ 1); buf ^= 1; }
+        else if (!FA_ABL_NOBARRIER) __syncthreads();
         kt = kt_nx;
     }
 
-    l += __shfl_xor(l, 16);
+    l += xchg16(l);
     float * op = part_O + (((int64_t) split*HQ + hq)*n_q + q)*D;
     #pragma unroll
     for (int dt = 0; dt < D/16; ++dt)
