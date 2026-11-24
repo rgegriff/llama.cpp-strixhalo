@@ -26,6 +26,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #define CHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { printf("HIP error %s at %s:%d\n", hipGetErrorString(e), __FILE__, __LINE__); exit(1); } } while (0)
@@ -36,6 +37,15 @@ constexpr int NSUB = KT/16;               // 16-key WMMA sub-tiles per tile
 constexpr int K_LD16 = D*2/16 + 1;        // K row in LDS: 17 x 16 B (padded against bank conflicts)
 constexpr int V_LD16 = KT*2/16 + 1;       // V^T row in LDS: 9 x 16 B
 constexpr int LDS_K = KT*K_LD16, LDS_V = D*V_LD16;   // in uint4
+#ifndef FA_LOOKAHEAD
+#define FA_LOOKAHEAD 2
+#endif
+#ifndef FA_STEPS
+#define FA_STEPS 2
+#endif
+#ifndef FA_SCHED
+#define FA_SCHED 1
+#endif
 
 typedef __attribute__((ext_vector_type(16))) _Float16 halfx16;
 typedef __attribute__((ext_vector_type(8)))  float    floatx8;
@@ -47,6 +57,19 @@ __device__ __forceinline__ floatx8 wmma(const halfx16 & a, const halfx16 & b, co
     // D[i][j] = sum_k a_lane(i)[k] * b_lane(j)[k]; lane l holds D[2e + l/16][l%16] (probed: wmma_probe.hip)
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
+// ask the scheduler for: 2*LA ds_reads up front, then (1 WMMA, 2 ds_reads) x (8-LA), then LA WMMAs (one 16-key sub-tile)
+__device__ __forceinline__ void sched_pipeline() {
+#if FA_SCHED
+    constexpr int LA = FA_LOOKAHEAD;
+    __builtin_amdgcn_sched_group_barrier(0x100, 2*LA, 0);
+    #pragma unroll
+    for (int i = 0; i < D/16 - LA; ++i) {
+        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(0x100, 2, 0);
+    }
+    __builtin_amdgcn_sched_group_barrier(0x008, LA, 0);
+#endif
+}
 __device__ __forceinline__ float bias_val(__half mk, int bin, const float * tbl, int n_bins) {    // fattn_indexed_bias::add
     return (uint32_t) bin < (uint32_t) n_bins ? __half2float(__float2half(__half2float(mk) + tbl[bin])) : __half2float(mk);
 }
@@ -54,7 +77,7 @@ __device__ __forceinline__ uint32_t pack_half2(float a, float b) {
     return (uint32_t) __half_as_ushort(__float2half(a)) | ((uint32_t) __half_as_ushort(__float2half(b)) << 16);
 }
 
-// flags[qt][kt]: 0 gather, 1 per-row constant (indices and mask constant along each of the 16 rows), 2 constant and all rows -inf
+// flags[kt][qt]: 0 gather, 1 per-row constant (indices and mask constant along each of the 16 rows), 2 constant and all rows -inf
 __global__ void fa_flags(const __half * __restrict__ mask, const int32_t * __restrict__ idx, int n_kv, uint8_t * __restrict__ flags) {
     const int kt = blockIdx.x, qt = blockIdx.y, n_kt = gridDim.x, t = threadIdx.x;     // 256 threads: 16 rows x 16 groups of 4 keys
     const int r = t/16, q = qt*16 + r, k = kt*KT + (t % 16)*4;
@@ -67,7 +90,7 @@ __global__ void fa_flags(const __half * __restrict__ mask, const int32_t * __res
               && __half2float(__ushort_as_half(mu.y & 0xffff)) == ref_m && __half2float(__ushort_as_half(mu.y >> 16)) == ref_m;
     const bool all_uni = __syncthreads_and(uni);
     const bool all_inf = __syncthreads_and(ref_m == -INFINITY);
-    if (t == 0) flags[(int64_t) qt*n_kt + kt] = !all_uni ? 0 : (all_inf ? 2 : 1);
+    if (t == 0) flags[(int64_t) kt*gridDim.y + qt] = !all_uni ? 0 : (all_inf ? 2 : 1);
 }
 
 template <int QT>
@@ -77,6 +100,15 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
         const uint8_t * __restrict__ flags, int n_q, int n_kv, int kt_per_split, float scale,
         float * __restrict__ part_O, float2 * __restrict__ part_ml) {
     constexpr int NW = QT/16*G, NT = NW*WAVE;
+    // tile prefetch roles (wave-uniform): with >= 768 threads the first 256 load the V tasks and the rest the K chunks,
+    // so no thread holds more than 16 prefetch VGPRs; smaller workgroups share both
+    constexpr int NVT = KT/4*16;                        // 4-key x 8-d V tasks per tile (256)
+    constexpr bool ROLES = NT >= 768;
+    constexpr int KT0 = ROLES ? NVT : 0, NKT = NT - KT0;            // first thread and thread count for K chunks
+    constexpr int NKLD = (KT*16 + NKT - 1)/NKT;                      // 16 B K chunks per K thread per tile
+    constexpr int NVLD = (NVT + NT - 1)/NT;                          // V tasks per thread per tile
+    constexpr int STEPS = FA_STEPS, SUBS = NSUB/STEPS;  // softmax steps per tile, 16-key sub-tiles per step
+    constexpr int LA = QT >= 128 ? FA_LOOKAHEAD : 1;    // LDS fragments in flight ahead of the WMMA that consumes them
     __shared__ uint4 lds[LDS_K + LDS_V];
     uint4 * Ks = lds; uint4 * Vt = lds + LDS_K;
 
@@ -88,6 +120,7 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
     const float * tbl = table + (int64_t) q*HQ*n_bins + hq*n_bins;
     const __half   * mrow = mask + (int64_t) q*n_kv;
     const int32_t  * irow = idx  + (int64_t) q*n_kv;
+    const __half * Kh = K + hk*D, * Vh = V + hk*D;
 
     // Q as WMMA B operands (lane holds query row q, 16 d's per fragment), scaled and rounded to f16 like llama.cpp
     halfx16 Qb[D/16];
@@ -108,110 +141,169 @@ __global__ __launch_bounds__(QT/16*G*WAVE) void fa_prefill(
     for (int dt = 0; dt < D/16; ++dt) O[dt] = (floatx8) {0, 0, 0, 0, 0, 0, 0, 0};
     float m = -1e30f, l = 0.0f;
 
-    for (int kt = kt_begin; kt < kt_end; ++kt) {
-        bool all_masked = true;
-        #pragma unroll
-        for (int i = 0; i < QT/16; ++i) all_masked = all_masked && flags[(int64_t) (qbase/16 + i)*n_kt + kt] == 2;
-        if (all_masked) continue;                                         // uniform across the workgroup
-        const int flag = flags[(int64_t) (q0/16)*n_kt + kt];
+    // the next tile that is not skipped by the whole workgroup (all QT/16 flags == 2); kt_end if none
+    const int n_qt = n_q/16;
+    typedef typename std::conditional<QT == 32, uint16_t, typename std::conditional<QT == 64, uint32_t, uint64_t>::type>::type flagword_t;
+    constexpr flagword_t ALL2 = (flagword_t) 0x0202020202020202ull;
+    flagword_t fw = 0;                     // the workgroup's QT/16 flags of the tile next_tile() returned
+    auto next_tile = [&](int kt) {
+        for (; kt < kt_end; ++kt) {
+            fw = *(const flagword_t *) (flags + (int64_t) kt*n_qt + qbase/16);
+            if (fw != ALL2) break;
+        }
+        return kt;
+    };
+    // c < limit is the same for all lanes of a wave (NT, limit are multiples of 32): say so, or the compiler masks the
+    // load and merges its result immediately, which defeats the prefetch
+    auto uni = [](int c, int limit) { return __builtin_amdgcn_readfirstlane(c) < limit; };
+    uint4 pk[NKLD]; uint32_t pv[NVLD][4][4];
+    __half mk_nx; int bin_nx;               // the row's mask/bin at the first key of the prefetched tile (uniform tiles)
+    auto prefetch = [&](int kt) {        // global loads of tile kt into registers
         const int kbase = kt*KT;
+        mk_nx = mrow[kbase]; bin_nx = irow[kbase];
+        #pragma unroll
+        for (int i = 0; i < NKLD; ++i) {
+            const int c = tid - KT0 + i*NKT, key = c/16, dc = c % 16;
+            if (uni(c, KT*16) && (!ROLES || __builtin_amdgcn_readfirstlane(tid) >= KT0))
+                pk[i] = *(const uint4 *) (Kh + (int64_t) (kbase + key)*kv_pos_stride + dc*8);
+        }
+        #pragma unroll
+        for (int t = 0; t < NVLD; ++t) {
+            const int c = tid + t*NT, dc = c % 16, kg = c/16;
+            if (uni(c, KT/4*16)) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 x = *(const uint4 *) (Vh + (int64_t) (kbase + kg*4 + i)*kv_pos_stride + dc*8);
+                    pv[t][i][0] = x.x; pv[t][i][1] = x.y; pv[t][i][2] = x.z; pv[t][i][3] = x.w;
+                }
+            }
+        }
+    };
+    auto store_lds = [&]() {             // registers -> LDS: K as [key][d], V transposed to [d][key]
+        #pragma unroll
+        for (int i = 0; i < NKLD; ++i) {
+            const int c = tid - KT0 + i*NKT, key = c/16, dc = c % 16;
+            if (uni(c, KT*16) && (!ROLES || __builtin_amdgcn_readfirstlane(tid) >= KT0)) Ks[key*K_LD16 + dc] = pk[i];
+        }
+        uint2 * dst = (uint2 *) Vt;
+        #pragma unroll
+        for (int t = 0; t < NVLD; ++t) {
+            const int c = tid + t*NT, dc = c % 16, kg = c/16;
+            if (uni(c, KT/4*16)) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t sel = (j & 1) ? 0x07060302u : 0x05040100u;
+                    const uint32_t a = __builtin_amdgcn_perm(pv[t][1][j/2], pv[t][0][j/2], sel);
+                    const uint32_t b = __builtin_amdgcn_perm(pv[t][3][j/2], pv[t][2][j/2], sel);
+                    dst[(dc*8 + j)*(V_LD16*2) + kg] = make_uint2(a, b);
+                }
+            }
+        }
+    };
 
-        // K tile -> LDS [key][d]; 16 lanes cover one 256 B row
-        for (int c = tid; c < KT*16; c += NT) {
-            const int key = c/16, dc = c % 16;
-            Ks[key*K_LD16 + dc] = *(const uint4 *) (K + (int64_t) (kbase + key)*kv_pos_stride + hk*D + dc*8);
-        }
-        // V tile -> LDS transposed [d][key]: each task loads 4 keys x 8 d and writes 8 x (4 keys)
-        for (int c = tid; c < KT/4*16; c += NT) {
-            const int dc = c % 16, kg = c/16;
-            uint32_t v[4][4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const uint4 x = *(const uint4 *) (V + (int64_t) (kbase + kg*4 + i)*kv_pos_stride + hk*D + dc*8);
-                v[i][0] = x.x; v[i][1] = x.y; v[i][2] = x.z; v[i][3] = x.w;
-            }
-            uint2 * dst = (uint2 *) Vt;
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const uint32_t sel = (j & 1) ? 0x07060302u : 0x05040100u;
-                const uint32_t a = __builtin_amdgcn_perm(v[1][j/2], v[0][j/2], sel);
-                const uint32_t b = __builtin_amdgcn_perm(v[3][j/2], v[2][j/2], sel);
-                dst[(dc*8 + j)*(V_LD16*2) + kg] = make_uint2(a, b);
-            }
-        }
+    int kt = next_tile(kt_begin);
+    if (kt < kt_end) prefetch(kt);
+    __half mk_cur = __float2half(0.0f); int bin_cur = -1; float brow = bias_val(mk_cur, bin_cur, tbl, n_bins);
+    while (kt < kt_end) {
+        const int flag = (int) ((fw >> (8*(w/G))) & 0xff);
+        const int kbase = kt*KT;
+        store_lds();
+        const __half mk = mk_nx; const int bin = bin_nx;
         __syncthreads();
+        const int kt_nx = next_tile(kt + 1);
+        if (kt_nx < kt_end) prefetch(kt_nx);          // in flight while this tile is computed
+        // row-constant bias of a uniform tile: only re-gather the table when the bin or the mask changes (rare)
+        if (flag == 1 && (bin != bin_cur || __half_as_ushort(mk) != __half_as_ushort(mk_cur))) {
+            bin_cur = bin; mk_cur = mk; brow = bias_val(mk, bin, tbl, n_bins);
+        }
 
         if (flag != 2) {
-            // S^T = K.Q^T: lane holds S[key = kbase + sub*16 + 2e + hh][q]
-            floatx8 s[NSUB];
-            #pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub) {
-                floatx8 c = (floatx8) {0, 0, 0, 0, 0, 0, 0, 0};
-                const uint4 * kp = Ks + (sub*16 + l16)*K_LD16;
+            #pragma unroll 1
+            for (int step = 0; step < STEPS; ++step) {
+                // S^T = K.Q^T: lane holds S[key = kbase + sub*16 + 2e + hh][q]; K fragments pipelined 4 ahead
+                floatx8 s[SUBS];
                 #pragma unroll
-                for (int dt = 0; dt < D/16; ++dt) c = wmma(ld_frag(kp + 2*dt), Qb[dt], c);
-                s[sub] = c;
-            }
-            if (flag == 1) {
-                const float b = bias_val(mrow[kbase], irow[kbase], tbl, n_bins);
-                #pragma unroll
-                for (int sub = 0; sub < NSUB; ++sub)
+                for (int ss = 0; ss < SUBS; ++ss) {
+                    const int sub = step*SUBS + ss;
+                    const uint4 * kp = Ks + (sub*16 + l16)*K_LD16;
+                    halfx16 kf[LA];
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) s[sub][e] += b;
-            } else {
-                #pragma unroll
-                for (int sub = 0; sub < NSUB; ++sub)
+                    for (int i = 0; i < LA; ++i) kf[i] = ld_frag(kp + 2*i);
+                    floatx8 c = (floatx8) {0, 0, 0, 0, 0, 0, 0, 0};
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
-                        const int k = kbase + sub*16 + 2*e + hh;
-                        s[sub][e] += bias_val(mrow[k], irow[k], tbl, n_bins);
+                    for (int dt = 0; dt < D/16; ++dt) {
+                        const halfx16 a = kf[dt % LA];
+                        if (dt + LA < D/16) kf[dt % LA] = ld_frag(kp + 2*(dt + LA));
+                        c = wmma(a, Qb[dt], c);
                     }
-            }
-            // online softmax over the 64 keys of this tile (the row's other 8 keys per sub-tile live in lane^16)
-            float mt = s[0][0];
-            #pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub)
-                #pragma unroll
-                for (int e = 0; e < 8; ++e) mt = fmaxf(mt, s[sub][e]);
-            mt = fmaxf(mt, __shfl_xor(mt, 16));
-            const float mn = fmaxf(m, mt), alpha = __expf(m - mn);
-            m = mn;
-            float ps = 0.0f;
-            #pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub)
-                #pragma unroll
-                for (int e = 0; e < 8; ++e) { const float p = __expf(s[sub][e] - mn); s[sub][e] = p; ps += p; }
-            l = l*alpha + ps;
-            #pragma unroll
-            for (int dt = 0; dt < D/16; ++dt) O[dt] *= alpha;
-
-            // P as WMMA B operands: lane needs P[q][sub*16 + 0..15]; it has the keys of parity hh, lane^16 the others
-            halfx16 Pb[NSUB];
-            #pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub) {
-                uint32_t x[4], y[4];
-                #pragma unroll
-                for (int e2 = 0; e2 < 4; ++e2) x[e2] = pack_half2(s[sub][2*e2], s[sub][2*e2 + 1]);
-                #pragma unroll
-                for (int e2 = 0; e2 < 4; ++e2) y[e2] = __shfl_xor(x[e2], 16);
-                union { uint32_t u[8]; halfx16 h; } r;
-                #pragma unroll
-                for (int e2 = 0; e2 < 4; ++e2) {
-                    const uint32_t a = hh ? y[e2] : x[e2], b = hh ? x[e2] : y[e2];   // a = even keys, b = odd keys
-                    r.u[2*e2]     = (a & 0xffffu) | (b << 16);
-                    r.u[2*e2 + 1] = (a >> 16) | (b & 0xffff0000u);
+                    sched_pipeline();
+                    s[ss] = c;
                 }
-                Pb[sub] = r.h;
-            }
-            // O^T += V^T.P^T: lane holds O[d = dt*16 + 2e + hh][q]
-            #pragma unroll
-            for (int dt = 0; dt < D/16; ++dt) {
-                const uint4 * vp = Vt + (dt*16 + l16)*V_LD16;
+                if (flag == 1) {
+                    #pragma unroll
+                    for (int ss = 0; ss < SUBS; ++ss)
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) s[ss][e] += brow;
+                } else {
+                    #pragma unroll
+                    for (int ss = 0; ss < SUBS; ++ss)
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            const int k = kbase + (step*SUBS + ss)*16 + 2*e + hh;
+                            s[ss][e] += bias_val(mrow[k], irow[k], tbl, n_bins);
+                        }
+                }
+                // online softmax over this step's keys (the row's other keys live in lane^16)
+                float mt = s[0][0];
                 #pragma unroll
-                for (int sub = 0; sub < NSUB; ++sub) O[dt] = wmma(ld_frag(vp + 2*sub), Pb[sub], O[dt]);
+                for (int ss = 0; ss < SUBS; ++ss)
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) mt = fmaxf(mt, s[ss][e]);
+                mt = fmaxf(mt, __shfl_xor(mt, 16));
+                const float mn = fmaxf(m, mt), alpha = __expf(m - mn);
+                m = mn;
+                float ps = 0.0f;
+                #pragma unroll
+                for (int ss = 0; ss < SUBS; ++ss)
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) { const float p = __expf(s[ss][e] - mn); s[ss][e] = p; ps += p; }
+                l = l*alpha + ps;
+                #pragma unroll
+                for (int dt = 0; dt < D/16; ++dt) O[dt] *= alpha;
+
+                // P as WMMA B operands, then O^T += V^T.P^T (lane holds O[d = dt*16 + 2e + hh][q]); V fragments pipelined
+                #pragma unroll
+                for (int ss = 0; ss < SUBS; ++ss) {
+                    const int sub = step*SUBS + ss;
+                    uint32_t x[4], y[4];
+                    #pragma unroll
+                    for (int e2 = 0; e2 < 4; ++e2) x[e2] = pack_half2(s[ss][2*e2], s[ss][2*e2 + 1]);
+                    #pragma unroll
+                    for (int e2 = 0; e2 < 4; ++e2) y[e2] = __shfl_xor(x[e2], 16);
+                    union { uint32_t u[8]; halfx16 h; } r;
+                    #pragma unroll
+                    for (int e2 = 0; e2 < 4; ++e2) {
+                        const uint32_t a = hh ? y[e2] : x[e2], b = hh ? x[e2] : y[e2];   // a = even keys, b = odd keys
+                        r.u[2*e2]     = (a & 0xffffu) | (b << 16);
+                        r.u[2*e2 + 1] = (a >> 16) | (b & 0xffff0000u);
+                    }
+                    const halfx16 Pb = r.h;
+                    const uint4 * vp = Vt + l16*V_LD16 + 2*sub;
+                    halfx16 vf[LA];
+                    #pragma unroll
+                    for (int i = 0; i < LA; ++i) vf[i] = ld_frag(vp + i*16*V_LD16);
+                    #pragma unroll
+                    for (int dt = 0; dt < D/16; ++dt) {
+                        const halfx16 a = vf[dt % LA];
+                        if (dt + LA < D/16) vf[dt % LA] = ld_frag(vp + (dt + LA)*16*V_LD16);
+                        O[dt] = wmma(a, Pb, O[dt]);
+                    }
+                    sched_pipeline();
+                }
             }
         }
         __syncthreads();
+        kt = kt_nx;
     }
 
     l += __shfl_xor(l, 16);
