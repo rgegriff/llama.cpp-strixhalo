@@ -371,9 +371,22 @@ bool ggml_cuda_flash_attn_ext_inkling_prefill(ggml_backend_cuda_context & ctx, g
         (!sinks || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == FP_HQ)) &&
         max_bias == 0.0f && softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0 && ggml_is_contiguous(dst);
     if (!shape_ok) {
+        static const bool debug = fp_env("GGML_CUDA_FATTN_INKLING_DEBUG", 0) != 0;
+        if (debug && n_q > 1) {
+            fprintf(stderr, "inkling prefill: rejected n_q %lld n_kv %lld K %s V %s qt %d f16_direct %d rows %d mask[%lld,%lld,%lld] tbl[%lld,%lld,%lld] idx[%lld,%lld] Qnb %zu/%zu sinks %d mb %.1f sc %.1f p4 %d\n",
+                (long long) n_q, (long long) n_kv, ggml_type_name(K->type), ggml_type_name(V->type), qt, f16_direct, dst->src[5] != nullptr,
+                mask ? (long long) mask->ne[0] : -1, mask ? (long long) mask->ne[1] : -1, mask ? (long long) mask->ne[2] : -1,
+                table ? (long long) table->ne[0] : -1, table ? (long long) table->ne[1] : -1, table ? (long long) table->ne[2] : -1,
+                idx ? (long long) idx->ne[0] : -1, idx ? (long long) idx->ne[1] : -1, Q->nb[1], Q->nb[2], sinks != nullptr, max_bias, softcap,
+                ggml_get_op_params_i32(dst, 4));
+        }
         return false;
     }
 
+    {
+        static const bool debug = fp_env("GGML_CUDA_FATTN_INKLING_DEBUG", 0) != 0;
+        if (debug) fprintf(stderr, "inkling prefill: taken n_q %lld n_kv %lld K %s qt %d\n", (long long) n_q, (long long) n_kv, ggml_type_name(K->type), qt);
+    }
     cudaStream_t st = ctx.stream();
     const half * Kf = (const half *) K->data, * Vf = (const half *) V->data;
     ggml_cuda_pool_alloc<half> Kc(ctx.pool()), Vc(ctx.pool());
