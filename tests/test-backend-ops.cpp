@@ -13074,6 +13074,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // IQ4_NL experts with ne00, ne01 multiples of 128: the dedicated RDNA3.5 MUL_MAT_ID kernel (ggml-cuda/mmq-inkling-moe.cu)
+    // takes these; both broadcast (gate/up) and per-slot (down) activations, full and partial 16/32-token tiles,
+    // experts with no rows, and a 128-expert routing like Inkling 2 Mini's.
+    for (int n : {32, 33, 47, 48, 49, 100}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 4, 4, false, 512, n, 256));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  16, 4, true,  256,  64, 384));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  16, 4, false, 256,  64, 384));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  256, 512, 128));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 256, 512, 128));
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {

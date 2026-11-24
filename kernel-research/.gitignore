@@ -28,3 +28,7 @@ fa-smallbatch/fa_smallbatch_*
 fa-smallbatch/wmma_iu8_probe
 fa-smallbatch/wmma_half_probe
 fa-smallbatch/results/
+moe/moe_wmma
+moe/moe_wmma_*
+moe/moe_bench_moe
+moe/isa/moe_wmma_*.s

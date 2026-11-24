@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmq-inkling-moe.cuh"
 
 #include <cstdint>
 
@@ -244,9 +245,16 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    // Inkling 2 Mini MoE: dedicated IQ4_NL WMMA kernel for the expert matmuls on RDNA3.5, GGML_CUDA_INKLING_MOE=0 disables.
+    // It takes the ids helper and the Q8_1 quantization from this function and replaces the MMQ tile loop.
+    const bool use_inkling_moe = ids && ggml_cuda_mmq_inkling_moe_applies(src0->type, cc, ne00, ne01, ne02, prec_src1, fusion != nullptr);
+
     int J_best        = 0;
     int nthreads_best = 0;
-    {
+    if (use_inkling_moe) {
+        J_best        = GGML_CUDA_INKLING_MOE_J;
+        nthreads_best = GGML_CUDA_INKLING_MOE_NTHREADS;
+    } else {
         int64_t ncols_opt = ne11;
         if (ids) {
             const int64_t n_expert_used = ids->ne[0];
@@ -393,6 +401,13 @@ void ggml_cuda_mul_mat_q(
     const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
+
+    if (use_inkling_moe) {
+        GGML_ASSERT(ne03 == 1);
+        ggml_cuda_mmq_inkling_moe(src0_d, src1_q8_1.get(), ids_dst.get(), (const int32_t *) ids->data, ids->nb[1] / ggml_element_size(ids),
+            tile_spec.get(), dst_d, ne00, ne01, ne02, ne12, n_expert_used, nb01, nb02, s1, ntj, stream);
+        return;
+    }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
