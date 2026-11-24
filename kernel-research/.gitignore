@@ -1,5 +1,7 @@
-# the 3.4 GB random-weight model (make_synth_gguf.py rebuilds it), raw graph dumps and logit files, GPU-slot results
-synth/
-results/
-logs/*.kld
+fa_decode
 logs/census-*-cpu.log
+logs/*.kld
+results/
+stream
+synth/
+# the 3.4 GB random-weight model (make_synth_gguf.py rebuilds it), raw graph dumps and logit files, GPU-slot results
