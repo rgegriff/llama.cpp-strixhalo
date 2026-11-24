@@ -14983,7 +14983,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Inkling 2 Mini full-attention decode: D=128, 8 KV heads x 3 query heads, one token, long KV.
     for (int kv : { 32768, 131072, 262144 }) {
-        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
         }
     }
