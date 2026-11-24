@@ -3,6 +3,8 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <type_traits>
 
@@ -307,6 +309,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
             return get_mmvq_mmid_max_batch_rdna4(type);
+        }
+        // On RDNA3.5 Q8_0 MUL_MAT_ID with >= 4 tokens is faster with MMQ once tokens share experts (MMVQ reads
+        // an expert once per token routed to it: gate_up 2304x2304 at 8 tokens, 30 experts: 1.56 -> 0.82 ms).
+        // GGML_CUDA_MMID_Q8_MMQ_MIN=n moves the threshold, 0 restores the table value (MMVQ up to 8 tokens).
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0) {
+            static const int q8_mmq_min = [] { const char * e = getenv("GGML_CUDA_MMID_Q8_MMQ_MIN"); return e ? atoi(e) : 4; }();
+            if (q8_mmq_min > 0) {
+                return std::min(q8_mmq_min - 1, MMVQ_MAX_BATCH_SIZE);
+            }
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
             return get_mmvq_mmid_max_batch_rdna3(type);
