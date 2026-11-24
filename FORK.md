@@ -46,15 +46,18 @@ All are environment variables read once per process. Unset means the default.
 | variable | default | effect | to disable |
 |---|---|---|---|
 | `GGML_CUDA_INKLING2_FUSION` | on | fuse the Inkling 2 glue-op chains (clip, short conv + state store, SiTU, depth mix, loop controller, bias table) into single kernels | `=0` |
+| `GGML_CUDA_INKLING2_CONV_MT` | `1` | bit mask for the short-conv fusion on 2..32-token batches (speculative-decoding verify): bit 0 `CONV_STATE` (bit-identical), bit 1 `CONV_DYN` (opt-in: changes the logits slightly, KL ~0.004, cause not identified). `3` enables both | `=0` |
 | `GGML_CUDA_FATTN_INKLING` | on | one-query decode attention over a q8_0/q4_0 KV cache with the indexed bias, contexts of `GGML_CUDA_FATTN_INKLING_MIN_KV` (65536) keys and more | `=0` |
 | `GGML_CUDA_FATTN_INKLING_SMALL` | on | the same for 2..16 queries (speculative-decoding verify), from `GGML_CUDA_FATTN_INKLING_SMALL_MIN_KV` (32768) keys | `=0` |
 | `GGML_CUDA_FATTN_INKLING_PREFILL` | on | WMMA prefill attention with the indexed bias; `GGML_CUDA_FATTN_INKLING_BAND_MAX_KV` (16384) bounds the band bias path | `=0` |
 | `GGML_CUDA_FATTN_VEC_GQA` | on | GQA variant of the vector flash-attention kernel when decoding with an indexed bias | `=0` |
 | `GGML_CUDA_INKLING_MOE` | on | dedicated IQ4_NL `MUL_MAT_ID` WMMA kernel on RDNA 3.5 | `=0` |
 | `LLAMA_DSPARK_GREEDY_CHAIN` | off | Inkling 2 DSpark draft: chain the rnn Markov head on the argmax and build no in-graph draws (fewer ops per draft). Probabilistic drafting (`--spec-draft-sampling probabilistic`) is then ignored | leave unset |
+| `GGML_CUDA_MMID_Q8_MMQ_MIN` | `4` | RDNA 3.5: Q8_0 `MUL_MAT_ID` goes to MMQ from this many tokens (MMVQ below) | `=0` (stock table) |
 | `LLAMA_INKLING_KV_ROT` | off | experiment: Hadamard rotation of Q/K (bit 1) and V (bit 2) ahead of the KV cache | leave unset |
 | `GGML_CUDA_OP_STATS` | off | `1`: count dispatched ops and fused chains per graph evaluation; `2`: also synchronize and time each kind of op (slow) | leave unset |
-| `GGML_CUDA_FATTN_INKLING_DEBUG`, `GGML_CUDA_INKLING_MOE_DEBUG` | off | log which calls the dedicated kernels take or reject | leave unset |
+| `GGML_CUDA_MMID_ROUTE_STATS` | off | `1`: per-shape histogram of experts touched by small `MUL_MAT_ID` batches, printed at exit (synchronizes the stream) | leave unset |
+| `GGML_CUDA_FATTN_INKLING_DEBUG`, `GGML_CUDA_INKLING_MOE_DEBUG`, `GGML_CUDA_INKLING2_CONV_MT_DEBUG` | off | log which calls the dedicated kernels take or reject | leave unset |
 
 `GGML_CUDA_DISABLE_FUSION=1` (upstream) turns off every fusion, including this fork's. The J=16 `MUL_MAT_ID` tile choice
 on RDNA 3.5 has no switch. With every switch above at `0` the fork's dedicated kernels are bypassed; the indexed-bias
