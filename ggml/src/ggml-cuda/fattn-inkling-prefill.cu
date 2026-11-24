@@ -51,19 +51,22 @@ static __device__ __forceinline__ uint32_t fp_pack_half2(float a, float b) {
     return (uint32_t) __half_as_ushort(__float2half(a)) | ((uint32_t) __half_as_ushort(__float2half(b)) << 16);
 }
 
-// q8_0 cache (any position/head strides) -> f16 [pos][head][128]; one thread per 32-value block
+// q8_0 cache (any position/head strides) -> f16 [pos][head][128]. One thread per 8 consecutive values, so a wave writes
+// 512 contiguous bytes (a block per thread with 64 B each was 4x slower: kernel-research/fa-prefill/fa_prefill2.hip, conv_*).
 static __global__ void fp_q8_0_to_f16(const char * __restrict__ x, int64_t nb1, int64_t nb2, int n_kv, half * __restrict__ y) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;   // block index over [pos][head][4]
-    if (i >= (int64_t) n_kv*FP_HKV*4) return;
-    const int b = i % 4, h = (i/4) % FP_HKV; const int64_t pos = i/(4*FP_HKV);
-    const char * blk = x + pos*nb1 + h*nb2 + b*34;
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;   // index over [pos][head][16 groups of 8]
+    if (i >= (int64_t) n_kv*FP_HKV*16) return;
+    const int j = i % 16, h = (i/16) % FP_HKV; const int64_t pos = i/(16*FP_HKV);
+    const char * blk = x + pos*nb1 + h*nb2 + (j/4)*34;
     const float d = __half2float(*(const half *) blk);
-    half2 * out = (half2 *) (y + (pos*FP_HKV + h)*FP_D + b*32);
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        const uint16_t q2 = *(const uint16_t *) (blk + 2 + 2*j);
-        out[j] = __floats2half2_rn(d*(float) (int8_t) (q2 & 0xff), d*(float) (int8_t) (q2 >> 8));
-    }
+    const uint32_t lo = *(const uint32_t *) (blk + 2 + (j%4)*8);      // 2-byte aligned: unaligned dword loads are full speed on RDNA
+    const uint32_t hi = *(const uint32_t *) (blk + 2 + (j%4)*8 + 4);
+    union { half2 h2[4]; uint4 u; } o;
+    o.h2[0] = __floats2half2_rn(d*(float) (int8_t) (lo),       d*(float) (int8_t) (lo >> 8));
+    o.h2[1] = __floats2half2_rn(d*(float) (int8_t) (lo >> 16), d*(float) (int8_t) (lo >> 24));
+    o.h2[2] = __floats2half2_rn(d*(float) (int8_t) (hi),       d*(float) (int8_t) (hi >> 8));
+    o.h2[3] = __floats2half2_rn(d*(float) (int8_t) (hi >> 16), d*(float) (int8_t) (hi >> 24));
+    ((uint4 *) y)[i] = o.u;
 }
 
 // flags[kt][qt]: 0 gather, 1 per-row constant, 2 constant and all rows -inf
@@ -375,10 +378,10 @@ bool ggml_cuda_flash_attn_ext_inkling_prefill(ggml_backend_cuda_context & ctx, g
     const half * Kf = (const half *) K->data, * Vf = (const half *) V->data;
     ggml_cuda_pool_alloc<half> Kc(ctx.pool()), Vc(ctx.pool());
     if (!f16_direct) {
-        const int64_t n = n_kv*FP_HKV*FP_D, nblk = n_kv*FP_HKV*4;
+        const int64_t n = n_kv*FP_HKV*FP_D, ngrp = n_kv*FP_HKV*16;
         Kc.alloc(n); Vc.alloc(n);
-        fp_q8_0_to_f16<<<(nblk + 255)/256, 256, 0, st>>>((const char *) K->data, K->nb[1], K->nb[2], (int) n_kv, Kc.ptr);
-        fp_q8_0_to_f16<<<(nblk + 255)/256, 256, 0, st>>>((const char *) V->data, V->nb[1], V->nb[2], (int) n_kv, Vc.ptr);
+        fp_q8_0_to_f16<<<(ngrp + 255)/256, 256, 0, st>>>((const char *) K->data, K->nb[1], K->nb[2], (int) n_kv, Kc.ptr);
+        fp_q8_0_to_f16<<<(ngrp + 255)/256, 256, 0, st>>>((const char *) V->data, V->nb[1], V->nb[2], (int) n_kv, Vc.ptr);
         Kf = Kc.ptr; Vf = Vc.ptr;
     }
     const int n_kt = (int) (n_kv/FP_KT), kps = (n_kt + FP_SPLITS - 1)/FP_SPLITS;
