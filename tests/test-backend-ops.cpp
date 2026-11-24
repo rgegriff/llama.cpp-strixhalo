@@ -3909,7 +3909,7 @@ struct test_softcap : public test_case {
 // Inkling 2: the glue op chains of src/models/inkling2.cpp, built in the same op order as the model, so that a
 // backend that fuses them (CUDA, inkling2.cu) is compared against the unfused CPU ops
 struct test_inkling2 : public test_case {
-    enum chain_type { CLIP, CONV, SITU, MIX, CTRL, RELBIAS, CONV_STATE, CONV_DYN, TABLE };
+    enum chain_type { CLIP, CONV, SITU, MIX, CTRL, RELBIAS, CONV_STATE, CONV_DYN, TABLE, CLIP_L2 };
 
     const chain_type chain;
     const int64_t    n;     // channels
@@ -3927,7 +3927,7 @@ struct test_inkling2 : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         static const char * names[] = { "INKLING2_CLIP", "INKLING2_CONV", "INKLING2_SITU", "INKLING2_MIX", "INKLING2_CTRL",
-            "INKLING2_RELBIAS", "INKLING2_CONV_STATE", "INKLING2_CONV_DYN", "INKLING2_TABLE" };
+            "INKLING2_RELBIAS", "INKLING2_CONV_STATE", "INKLING2_CONV_DYN", "INKLING2_TABLE", "INKLING2_CLIP_L2" };
         return names[chain];
     }
 
@@ -3971,6 +3971,17 @@ struct test_inkling2 : public test_case {
                 norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
                 ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, 2.0f), norm);
                 out = ggml_mul(ctx, a, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+            } break;
+            case CLIP_L2: {
+                // the clip of the model since upstream #32940: y = t*a/max(|a|, t), a = x*w
+                ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, k, n_tok);
+                ggml_set_name(a, "x");
+                if (v) {
+                    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, k);
+                    ggml_set_name(w, "w");
+                    a = ggml_mul(ctx, a, w);
+                }
+                out = ggml_scale(ctx, ggml_l2_norm(ctx, a, 2.0f), 2.0f);
             } break;
             case CONV: {
                 // causal short convolution with a residual
@@ -12415,6 +12426,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP, 128, n_tok, 24, 1));
         test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP, 128, n_tok,  8, 0));
         test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP,  16, n_tok, 24, 1));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP_L2, 128, n_tok, 24, 1));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP_L2, 128, n_tok,  8, 0));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CLIP_L2,  16, n_tok, 24, 1));
         test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 1024, n_tok, 1, 0));
         test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 2304, n_tok, 1, 0));
         test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 2304, n_tok, 1, 1));

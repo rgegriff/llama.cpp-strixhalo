@@ -18,6 +18,7 @@ enum ggml_cuda_inkling2_fusion {
     GGML_CUDA_INKLING2_CTRL_NORM,  // RMS_NORM RMS_NORM CONCAT                          : controller input, large batches
     GGML_CUDA_INKLING2_CTRL_TAIL,  // TANH MUL SUB TANH MUL ADD                         : controller output, large batches
     GGML_CUDA_INKLING2_TABLE,      // PAD MUL_MAT SUB                                   : compact relative-position bias table
+    GGML_CUDA_INKLING2_CLIP_L2,    // [MUL] L2_NORM SCALE                               : row L2 clip since upstream #32940
 };
 
 struct ggml_cuda_inkling2_args {

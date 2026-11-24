@@ -217,6 +217,114 @@ static void inkling2_clip(ggml_backend_cuda_context & ctx, const ggml_cuda_inkli
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// CLIP_L2: y = (a * rsqrt(max(sum(a^2), eps^2)))*s0 + s1, a = x * w (w optional, broadcast over rows)
+// replaces [MUL] L2_NORM SCALE, the row L2 clip of the model graph since upstream #32940. The reduction is the one of
+// l2_norm_f32 for rows shorter than 1024 (one warp per row), so the result has the bits of the unfused ops.
+
+template <bool has_w>
+static __global__ void __launch_bounds__(WARP_SIZE) inkling2_clip_l2_f32(const float * x_ptr, const float * w_ptr, float * dst_ptr,
+        const int ncols, const int64_t ne1, const int64_t w_ne1, const int64_t w_s1,
+        const float eps, const float s0, const float s1) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    const float * x   = x_ptr + row*ncols;
+    const float * w   = has_w ? w_ptr + ((row % ne1) % w_ne1)*w_s1 : nullptr;
+    float       * dst = dst_ptr + row*ncols;
+
+    ggml_cuda_pdl_sync();
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += WARP_SIZE) {
+        const float a = has_w ? __fmul_rn(x[col], w[col]) : x[col];
+        tmp += a * a;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, WARP_SIZE>(tmp, (float *) nullptr);
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+    // the warp has read the whole row, so dst may be x
+    for (int col = tid; col < ncols; col += WARP_SIZE) {
+        const float a = has_w ? __fmul_rn(x[col], w[col]) : x[col];
+        dst[col] = __fadd_rn(__fmul_rn(__fmul_rn(scale, a), s0), s1);
+    }
+}
+
+static bool inkling2_match_clip_l2(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+    const bool has_w = cgraph->nodes[i]->op == GGML_OP_MUL;
+    const int  b     = has_w ? 1 : 0; // index of L2_NORM
+
+    if (has_w) {
+        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE }, { i + 2 })) {
+            return false;
+        }
+    } else if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_L2_NORM, GGML_OP_SCALE }, { i + 1 })) {
+        return false;
+    }
+
+    ggml_tensor * const * nodes = cgraph->nodes + i;
+
+    const ggml_tensor * x   = nodes[0]->src[0];
+    const ggml_tensor * w   = has_w ? nodes[0]->src[1] : nullptr;
+    ggml_tensor       * dst = nodes[b + 1];
+
+    if ((has_w && nodes[1]->src[0] != nodes[0]) || dst->src[0] != nodes[b]) {
+        return false;
+    }
+
+    // l2_norm_f32 runs rows of 1024 and more floats in blocks of 1024 threads: not replicated here
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(x, dst) || ggml_nrows(x) > INT_MAX || x->ne[0] >= 1024) {
+        return false;
+    }
+    if (w && (!inkling2_is_f32_rows(w) || w->ne[0] != x->ne[0] || (w->ne[1] != 1 && w->ne[1] != x->ne[1]) ||
+            w->ne[2] != 1 || w->ne[3] != 1)) {
+        return false;
+    }
+    if (!inkling2_same_or_disjoint(dst, x) || (w && inkling2_overlap(dst, w))) {
+        return false;
+    }
+
+    if (!inkling2_outside(cgraph, i, b + 2, { x, w })) {
+        return false;
+    }
+
+    args.type    = GGML_CUDA_INKLING2_CLIP_L2;
+    args.n_nodes = b + 2;
+    args.dst     = dst;
+    args.src[0]  = x;
+    args.src[1]  = w;
+    args.node[0] = nodes[b];     // L2_NORM
+    args.node[1] = nodes[b + 1]; // SCALE
+    return true;
+}
+
+static void inkling2_clip_l2(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_args & args) {
+    const ggml_tensor * x = args.src[0];
+    const ggml_tensor * w = args.src[1];
+
+    const int64_t ncols = x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const dim3 block_nums(nrows, 1, 1);
+
+    const float eps = ggml_get_op_params_f32(args.node[0], 0);
+    const float s0  = ggml_get_op_params_f32(args.node[1], 0);
+    const float s1  = ggml_get_op_params_f32(args.node[1], 1);
+
+    const ggml_cuda_kernel_launch_params params(block_nums, block_dims, 0, ctx.stream());
+    if (w) {
+        ggml_cuda_kernel_launch(inkling2_clip_l2_f32<true>, params, (const float *) x->data, (const float *) w->data,
+                (float *) args.dst->data, (int) ncols, x->ne[1], w->ne[1], (int64_t) (w->nb[1]/sizeof(float)), eps, s0, s1);
+    } else {
+        ggml_cuda_kernel_launch(inkling2_clip_l2_f32<false>, params, (const float *) x->data, (const float *) nullptr,
+                (float *) args.dst->data, (int) ncols, x->ne[1], (int64_t) 1, (int64_t) 0, eps, s0, s1);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // CONV: y[c, t] = (r[c, t] + sum_k x[t + k, c]*w[k, c])*s0 + s1
 
 static __global__ void inkling2_conv_f32(const float * x_ptr, const float * w_ptr, const float * r_ptr,
@@ -2212,9 +2320,12 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
 
     switch (cgraph->nodes[i]->op) {
         case GGML_OP_MUL:
-            return inkling2_match_clip(cgraph, i, args) || inkling2_match_situ(cgraph, i, args);
+            return inkling2_match_clip(cgraph, i, args) || inkling2_match_clip_l2(cgraph, i, args) ||
+                   inkling2_match_situ(cgraph, i, args);
         case GGML_OP_SQR:
             return inkling2_match_clip(cgraph, i, args);
+        case GGML_OP_L2_NORM:
+            return inkling2_match_clip_l2(cgraph, i, args);
         case GGML_OP_SSM_CONV:
             return inkling2_match_conv(cgraph, i, args);
         case GGML_OP_REPEAT:
@@ -2251,6 +2362,7 @@ void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_i
         case GGML_CUDA_INKLING2_CTRL_TAIL:  inkling2_ctrl_tail(ctx, args);  break;
         case GGML_CUDA_INKLING2_RELBIAS:    inkling2_relbias(ctx, args);    break;
         case GGML_CUDA_INKLING2_TABLE:      inkling2_table(ctx, args);      break;
+        case GGML_CUDA_INKLING2_CLIP_L2:    inkling2_clip_l2(ctx, args);    break;
         default: GGML_ABORT("fatal error");
     }
 }
