@@ -153,3 +153,4 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+ggml/src/ggml-cuda/fattn-tune.h

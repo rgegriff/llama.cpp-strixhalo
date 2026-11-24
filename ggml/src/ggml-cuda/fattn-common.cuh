@@ -1,6 +1,20 @@
 #pragma once
 
 #include "common.cuh"
+#if __has_include("fattn-tune.h")
+#include "fattn-tune.h" // tuning experiment: GGML_FATTN_VEC_* overrides
+#endif
+
+// The quantized K/V blocks are 18 (q4_0) or 34 (q8_0) bytes, so their data is only 2-byte aligned. RDNA does unaligned
+// global dword loads at full speed (kernel-research/bw), so with GGML_FATTN_VEC_UNALIGNED read them whole there.
+template <int nbytes>
+static __device__ __forceinline__ void ggml_cuda_load_kv_a2(void * __restrict__ dst, const void * __restrict__ src) {
+#if defined(GGML_USE_HIP) && defined(RDNA) && defined(GGML_FATTN_VEC_UNALIGNED)
+    ggml_cuda_memcpy_1<nbytes>(dst, src);
+#else
+    ggml_cuda_memcpy_1<nbytes, 2>(dst, src);
+#endif
+}
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -216,7 +230,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
         const int shift = k_KQ & (QI8_1/2);
 
         int v;
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4_0[ib].qs + sizeof(int)*iqs4);
+        ggml_cuda_load_kv_a2<sizeof(int)>(&v, K_q4_0[ib].qs + sizeof(int)*iqs4);
         v = (v >> shift) & 0x0F0F0F0F;
         const int u = Q_q8[k_KQ_0/nthreads];
 
@@ -370,7 +384,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         const int iqs = k_KQ % QI8_0;
 
         int v;
-        ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K_q8_0[ib].qs + 4*iqs);
+        ggml_cuda_load_kv_a2<sizeof(v)>(&v, K_q8_0[ib].qs + 4*iqs);
 
         const float2 * Q_ds = (const float2 *) Q_ds_v;
         const float Q_d = Q_ds[k_KQ_0/nthreads].x;
@@ -481,7 +495,7 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
-    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    ggml_cuda_load_kv_a2<ne>(&q, x[ib].qs + iqs);
 #if defined(GGML_USE_HIP)
     // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
     // increases VGPR pressure substantially in some FlashAttention vector kernels.
@@ -668,7 +682,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 
     static_assert(ne % 2 == 0, "bad ne");
     int8_t qs[ne];
-    ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
+    ggml_cuda_load_kv_a2<ne>(qs, x[ib].qs + iqs);
 
     if constexpr (std::is_same<T, half>::value) {
 #ifdef FP16_AVAILABLE

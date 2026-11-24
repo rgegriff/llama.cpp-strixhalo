@@ -88,7 +88,11 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
+#ifdef GGML_FATTN_VEC_KQ_Q_THREADS // tuning experiment
+    constexpr int nthreads_KQ_q = GGML_FATTN_VEC_KQ_Q_THREADS;
+#else
     constexpr int nthreads_KQ_q = 2;
+#endif
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif // RDNA
@@ -105,7 +109,11 @@ static __global__ void flash_attn_ext_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
+#ifdef GGML_FATTN_VEC_V_Q_ROWS // tuning experiment
+    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : GGML_FATTN_VEC_V_Q_ROWS;
+#else
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+#endif
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
