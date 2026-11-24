@@ -32,3 +32,18 @@ moe/moe_wmma
 moe/moe_wmma_*
 moe/moe_bench_moe
 moe/isa/moe_wmma_*.s
+# never tracked: logs, profiler databases, ISA dumps, build outputs
+*.log
+*.err
+*.dat
+*.db
+*.s
+*.bak
+*.kld
+*.o
+logs/
+moe/logs/
+moe/isa/
+moe/.rocprofv3/
+.rocprofv3/
+build-*/
