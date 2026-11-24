@@ -257,6 +257,20 @@ void ggml_cuda_mul_mat_q(
         }
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
+
+        // RDNA3.5 MoE (measured on gfx1151 only; RDNA3.0 and RDNA4 untested): the per-expert column counts
+        // are small, the tile loop does not overlap its global->LDS loads with the MMA work, and the extra weight
+        // re-reads of narrow column tiles are served from L2/MALL. With 128 experts, 8 used, 2304x2304 and 2304x1152
+        // IQ4_NL experts, J=16 is 1.4-2x faster than the J=32/64/128 tiles that ggml_cuda_mmq_get_J_best picks for
+        // 512..2048 tokens (kernel-research/moe/, bursts 3-4 and 8).
+        // The column tile count (ne_get_rows/J + ne02, see below) must stay within the 65535 grid limit, or the launch asserts.
+        if (ids && amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA3_5(cc) && (ne12*ids->ne[0] + 15)/16 + ne02 <= 65535) {
+            const ggml_cuda_mmq_config config16 = ggml_cuda_mmq_get_config(src0->type, 16, fallback, cc, prec_src1);
+            if (config16.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config16, cc) <= smpbo) {
+                J_best        = 16;
+                nthreads_best = config16.nthreads;
+            }
+        }
     }
     GGML_ASSERT(J_best > 0);
 
