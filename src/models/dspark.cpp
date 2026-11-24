@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -282,6 +284,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
                 i*rnn_state->nb[1] + off*ggml_element_size(rnn_state)));
     };
 
+    // fork: LLAMA_DSPARK_GREEDY_CHAIN=1 chains the rnn head on the argmax, as the other DSpark heads do, and builds no
+    // draws: about 20 fewer small ops per block position when the drafts are never sampled (see FORK.md).
+    // common/speculative.cpp reads the same switch and then never asks for probabilistic drafts.
+    static const bool greedy_chain = [] { const char * e = getenv("LLAMA_DSPARK_GREEDY_CHAIN"); return e && atoi(e) != 0; }();
+    const bool draws = rnn_state && !greedy_chain;
+
     ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
     ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
     ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
@@ -289,7 +297,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // the anchor row holds f_rnn, so it cannot be a draft row
         GGML_ASSERT(!has_conf && !sample_from_anchor && rnn_state->ne[0] == n_embd);
         f_rnn = state_rows(n_embd, 0, 0);
-        if (block_drafts > i_draft_beg) {
+        if (draws && block_drafts > i_draft_beg) {
             inv_temp  = state_rows(1, 1, i_draft_beg);
             is_greedy = ggml_scale_bias(ctx0, ggml_step(ctx0, inv_temp), -1.0f, 1.0f);
         }
@@ -341,7 +349,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
-        if (rnn_state) {
+        if (draws) {
             cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
         }
     }
@@ -418,7 +426,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (rnn_state) {
+        if (draws) {
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
         } else if (i + 1 < block_drafts) {

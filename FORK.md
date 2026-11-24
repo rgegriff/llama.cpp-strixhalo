@@ -51,6 +51,7 @@ All are environment variables read once per process. Unset means the default.
 | `GGML_CUDA_FATTN_INKLING_PREFILL` | on | WMMA prefill attention with the indexed bias; `GGML_CUDA_FATTN_INKLING_BAND_MAX_KV` (16384) bounds the band bias path | `=0` |
 | `GGML_CUDA_FATTN_VEC_GQA` | on | GQA variant of the vector flash-attention kernel when decoding with an indexed bias | `=0` |
 | `GGML_CUDA_INKLING_MOE` | on | dedicated IQ4_NL `MUL_MAT_ID` WMMA kernel on RDNA 3.5 | `=0` |
+| `LLAMA_DSPARK_GREEDY_CHAIN` | off | Inkling 2 DSpark draft: chain the rnn Markov head on the argmax and build no in-graph draws (fewer ops per draft). Probabilistic drafting (`--spec-draft-sampling probabilistic`) is then ignored | leave unset |
 | `LLAMA_INKLING_KV_ROT` | off | experiment: Hadamard rotation of Q/K (bit 1) and V (bit 2) ahead of the KV cache | leave unset |
 | `GGML_CUDA_OP_STATS` | off | `1`: count dispatched ops and fused chains per graph evaluation; `2`: also synchronize and time each kind of op (slow) | leave unset |
 | `GGML_CUDA_FATTN_INKLING_DEBUG`, `GGML_CUDA_INKLING_MOE_DEBUG` | off | log which calls the dedicated kernels take or reject | leave unset |

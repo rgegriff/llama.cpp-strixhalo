@@ -1502,7 +1502,9 @@ public:
             }
 
             // the graph draws the block at the target's temperature, the verifier then does rejection sampling with q
-            sampled[seq_id] = has_markov_context && params.probabilistic && dp.result_q && dp.temp > 0.0f;
+            // fork: with LLAMA_DSPARK_GREEDY_CHAIN=1 the draft graph builds no draws (src/models/dspark.cpp)
+            static const bool greedy_chain = [] { const char * e = getenv("LLAMA_DSPARK_GREEDY_CHAIN"); return e && atoi(e) != 0; }();
+            sampled[seq_id] = !greedy_chain && has_markov_context && params.probabilistic && dp.result_q && dp.temp > 0.0f;
             if (sampled[seq_id] && draw_seed[seq_id] != dp.seed) {
                 draw_seed[seq_id] = dp.seed;
                 // the default seed means random; mixed so it differs from the target's, as in spec_retune
