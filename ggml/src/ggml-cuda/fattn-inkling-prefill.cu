@@ -69,7 +69,8 @@ static __global__ void fp_q8_0_to_f16(const char * __restrict__ x, int64_t nb1, 
     ((uint4 *) y)[i] = o.u;
 }
 
-// flags[kt][qt]: 0 gather, 1 per-row constant, 2 constant and all rows -inf
+// flags[kt][qt]: 0 gather, 1 per-row constant, 2 constant and all rows -inf, 3 indices affine in k (bin0 - dk) and mask
+// constant along each row: the relative-position band (fa_prefill3.hip, kern 78af45cd)
 static __global__ void fp_flags(const half * __restrict__ mask, int64_t mask_stride, const int32_t * __restrict__ idx, int n_kv,
         uint8_t * __restrict__ flags) {
     const int kt = blockIdx.x, qt = blockIdx.y, t = threadIdx.x;
@@ -81,12 +82,20 @@ static __global__ void fp_flags(const half * __restrict__ mask, int64_t mask_str
     bool uni = bi.x == ref_i && bi.y == ref_i && bi.z == ref_i && bi.w == ref_i;
     uni = uni && __half2float(__ushort_as_half(mu.x & 0xffff)) == ref_m && __half2float(__ushort_as_half(mu.x >> 16)) == ref_m
               && __half2float(__ushort_as_half(mu.y & 0xffff)) == ref_m && __half2float(__ushort_as_half(mu.y >> 16)) == ref_m;
+    const int dk = k - kt*FP_KT;
+    bool aff = bi.x == ref_i - dk && bi.y == ref_i - (dk + 1) && bi.z == ref_i - (dk + 2) && bi.w == ref_i - (dk + 3);
+    aff = aff && __half2float(__ushort_as_half(mu.x & 0xffff)) == ref_m && __half2float(__ushort_as_half(mu.x >> 16)) == ref_m
+              && __half2float(__ushort_as_half(mu.y & 0xffff)) == ref_m && __half2float(__ushort_as_half(mu.y >> 16)) == ref_m;
     const bool all_uni = __syncthreads_and(uni);
     const bool all_inf = __syncthreads_and(ref_m == -INFINITY);
-    if (t == 0) flags[(int64_t) kt*gridDim.y + qt] = !all_uni ? 0 : (all_inf ? 2 : 1);
+    const bool all_aff = __syncthreads_and(aff);
+    if (t == 0) flags[(int64_t) kt*gridDim.y + qt] = all_uni ? (all_inf ? 2 : 1) : (all_aff ? 3 : 0);
 }
 
-template <int QT>
+// BAND: the batched, branch-free bias path for flag 0/3 tiles (fa_prefill3.hip). It costs ~3% at n_kv 65536 (more live
+// registers on the hot flag-1 path), so it is only compiled into the variant used for short n_kv. Without it, flag 3 tiles
+// take the per-element gather, which is exact for any tile.
+template <int QT, bool BAND>
 __launch_bounds__(QT/16*FP_G*FP_WAVE)
 static __global__ void fp_attn(
         const float * __restrict__ Q, int64_t q_stride_q, int64_t q_stride_h,
@@ -213,6 +222,37 @@ static __global__ void fp_attn(
         if (flag != 2) {
 #pragma unroll 1
             for (int step = 0; step < FP_STEPS; ++step) {
+                uint32_t bbh[SUBS][4];
+                if (BAND && (flag == 0 || flag == 3)) {
+                    // issued before the S WMMAs so their latency overlaps the matmul; packed halves (the bias is a half)
+                    float bb[SUBS][8]; int bv[SUBS][8]; float mv[SUBS][8];
+                    if (flag == 3) {
+#pragma unroll
+                        for (int ss = 0; ss < SUBS; ++ss)
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) { bv[ss][e] = bin - ((step*SUBS + ss)*16 + 2*e + hh); mv[ss][e] = __half2float(mk); }
+                    } else {
+#pragma unroll
+                        for (int ss = 0; ss < SUBS; ++ss)
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) {
+                                const int k = kbase + (step*SUBS + ss)*16 + 2*e + hh;
+                                bv[ss][e] = irow[k]; mv[ss][e] = __half2float(mrow[k]);
+                            }
+                    }
+#pragma unroll
+                    for (int ss = 0; ss < SUBS; ++ss)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            const bool valid = (uint32_t) bv[ss][e] < (uint32_t) n_bins;
+                            const float tv = tbl[valid ? bv[ss][e] : 0];
+                            bb[ss][e] = valid ? __half2float(__float2half(mv[ss][e] + tv)) : mv[ss][e];
+                        }
+#pragma unroll
+                    for (int ss = 0; ss < SUBS; ++ss)
+#pragma unroll
+                        for (int e2 = 0; e2 < 4; ++e2) bbh[ss][e2] = fp_pack_half2(bb[ss][2*e2], bb[ss][2*e2 + 1]);
+                }
                 fp_floatx8 s[SUBS];
 #pragma unroll
                 for (int ss = 0; ss < SUBS; ++ss) {
@@ -236,6 +276,11 @@ static __global__ void fp_attn(
                     for (int ss = 0; ss < SUBS; ++ss)
 #pragma unroll
                         for (int e = 0; e < 8; ++e) s[ss][e] += brow;
+                } else if (BAND) {
+#pragma unroll
+                    for (int ss = 0; ss < SUBS; ++ss)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) s[ss][e] += __half2float(__ushort_as_half((unsigned short) (bbh[ss][e/2] >> (16*(e & 1)))));
                 } else {
 #pragma unroll
                     for (int ss = 0; ss < SUBS; ++ss)
@@ -321,11 +366,11 @@ static __global__ void fp_combine(const float * __restrict__ part_O, const float
     out[((int64_t) q*FP_HQ + hq)*FP_D + d] = acc/L;
 }
 
-template <int QT>
-void fp_launch(cudaStream_t st, const float * Q, int64_t qsq, int64_t qsh, const half * K, const half * V, int64_t kvps,
+template <int QT, bool BAND>
+void fp_launch(cudaStream_t st, int splits, const float * Q, int64_t qsq, int64_t qsh, const half * K, const half * V, int64_t kvps,
         const half * mask, int64_t ms, const int32_t * idx, const float * table, int n_bins, const uint8_t * flags,
         int n_q, int n_kv, int kps, float scale, float * pO, float2 * pml) {
-    fp_attn<QT><<<dim3(n_q/QT, FP_SPLITS, FP_HKV), QT/16*FP_G*FP_WAVE, 0, st>>>(Q, qsq, qsh, K, V, kvps, mask, ms, idx, table, n_bins,
+    fp_attn<QT, BAND><<<dim3(n_q/QT, splits, FP_HKV), QT/16*FP_G*FP_WAVE, 0, st>>>(Q, qsq, qsh, K, V, kvps, mask, ms, idx, table, n_bins,
         flags, n_q, n_kv, kps, scale, pO, pml);
 }
 
@@ -397,23 +442,27 @@ bool ggml_cuda_flash_attn_ext_inkling_prefill(ggml_backend_cuda_context & ctx, g
         fp_q8_0_to_f16<<<(ngrp + 255)/256, 256, 0, st>>>((const char *) V->data, V->nb[1], V->nb[2], (int) n_kv, Vc.ptr);
         Kf = Kc.ptr; Vf = Vc.ptr;
     }
-    const int n_kt = (int) (n_kv/FP_KT), kps = (n_kt + FP_SPLITS - 1)/FP_SPLITS;
+    // short contexts (sliding-window layers, shallow depth): one split and the band bias path (fa_prefill3.hip measurements)
+    static const int band_max_kv = fp_env("GGML_CUDA_FATTN_INKLING_BAND_MAX_KV", 16384);
+    const bool band = n_kv <= band_max_kv;
+    const int splits = n_kv > 4096 ? FP_SPLITS : 1;
+    const int n_kt = (int) (n_kv/FP_KT), kps = (n_kt + splits - 1)/splits;
     ggml_cuda_pool_alloc<uint8_t> flags(ctx.pool(), (size_t) n_kt*(n_q/16));
-    ggml_cuda_pool_alloc<float>   pO(ctx.pool(), (size_t) FP_SPLITS*FP_HQ*n_q*FP_D);
-    ggml_cuda_pool_alloc<float2>  pml(ctx.pool(), (size_t) FP_SPLITS*FP_HQ*n_q);
+    ggml_cuda_pool_alloc<float>   pO(ctx.pool(), (size_t) splits*FP_HQ*n_q*FP_D);
+    ggml_cuda_pool_alloc<float2>  pml(ctx.pool(), (size_t) splits*FP_HQ*n_q);
     const int64_t ms = mask->nb[1]/2;
     fp_flags<<<dim3(n_kt, n_q/16), 256, 0, st>>>((const half *) mask->data, ms, (const int32_t *) idx->data, (int) n_kv, flags.ptr);
     const int64_t qsq = Q->nb[1]/4, qsh = Q->nb[2]/4, kvps = FP_HKV*FP_D;
     const auto args = [&](auto launcher) {
-        launcher(st, (const float *) Q->data, qsq, qsh, Kf, Vf, kvps, (const half *) mask->data, ms, (const int32_t *) idx->data,
+        launcher(st, splits, (const float *) Q->data, qsq, qsh, Kf, Vf, kvps, (const half *) mask->data, ms, (const int32_t *) idx->data,
                  (const float *) table->data, (int) table->ne[0], flags.ptr, (int) n_q, (int) n_kv, kps, scale, pO.ptr, pml.ptr);
     };
     switch (qt) {
-        case 128: args(fp_launch<128>); break;
-        case 64:  args(fp_launch<64>);  break;
-        default:  args(fp_launch<32>);  break;
+        case 128: band ? args(fp_launch<128, true>) : args(fp_launch<128, false>); break;
+        case 64:  band ? args(fp_launch<64,  true>) : args(fp_launch<64,  false>); break;
+        default:  band ? args(fp_launch<32,  true>) : args(fp_launch<32,  false>); break;
     }
-    fp_combine<<<dim3((unsigned) n_q, FP_HQ), FP_D, 0, st>>>(pO.ptr, pml.ptr, sinks ? (const float *) sinks->data : nullptr, FP_SPLITS, (int) n_q,
+    fp_combine<<<dim3((unsigned) n_q, FP_HQ), FP_D, 0, st>>>(pO.ptr, pml.ptr, sinks ? (const float *) sinks->data : nullptr, splits, (int) n_q,
         (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
     return true;
