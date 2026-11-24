@@ -16,3 +16,15 @@ fa-prefill/fa_prefill2
 fa-prefill/fa_prefill3
 fa-prefill/fa_abl3_*
 fa-prefill/fa_abl_NOGATHER_ref
+# moe: binaries and the rocprofv3 database
+moe/moe_bench
+moe/moe_mmq
+moe/moe_mmq_*
+moe/wmma_iu8_peak
+moe/logs/prof/
+moe/logs/*.sclk
+fa-smallbatch/fa_smallbatch
+fa-smallbatch/fa_smallbatch_*
+fa-smallbatch/wmma_iu8_probe
+fa-smallbatch/wmma_half_probe
+fa-smallbatch/results/
