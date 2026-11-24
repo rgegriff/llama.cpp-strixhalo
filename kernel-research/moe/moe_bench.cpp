@@ -27,6 +27,7 @@ struct opts {
     int nmat = 128, nused = 8;
     bool bcast = true;
     double skew = 0.0;      // expert popularity ~ (e+1)^-skew; 0 = uniform
+    int pool = 0;           // > 0: route every token within the first `pool` experts (pool == nused: all tokens share the same experts)
     int reps = 20, warm = 3;
     int graph_reps = 4;     // copies of the op per graph
     bool check = false;
@@ -83,6 +84,7 @@ int main(int argc, char ** argv) {
         else if (a == "--nused")   o.nused   = atoi(next());
         else if (a == "--bcast")   o.bcast   = atoi(next()) != 0;
         else if (a == "--skew")    o.skew    = atof(next());
+        else if (a == "--pool")    o.pool    = atoi(next());
         else if (a == "--reps")    o.reps    = atoi(next());
         else if (a == "--warm")    o.warm    = atoi(next());
         else if (a == "--graph-reps") o.graph_reps = atoi(next());
@@ -133,7 +135,7 @@ int main(int argc, char ** argv) {
     std::vector<int> load(o.nmat, 0);
     {
         std::vector<double> w(o.nmat);
-        for (int e = 0; e < o.nmat; ++e) w[e] = std::pow(e + 1.0, -o.skew);
+        for (int e = 0; e < o.nmat; ++e) w[e] = (o.pool > 0 && e >= o.pool) ? 0.0 : std::pow(e + 1.0, -o.skew);
         std::discrete_distribution<int> D(w.begin(), w.end());
         for (int64_t t = 0; t < o.n; ++t) {
             int got = 0;
@@ -164,8 +166,8 @@ int main(int argc, char ** argv) {
     const double wbytes  = (double) ggml_nbytes(g.as);             // whole expert tensor (all experts touched at n=512)
     const double wactive = wbytes * lnz / o.nmat;                   // experts that have at least one token
     const double obytes  = (double) ggml_nbytes(g.out) + ggml_nbytes(g.b);
-    printf("[x%d] %-7s m=%lld k=%lld n=%lld nused=%d nmat=%d bcast=%d skew=%.2f | med %.3f ms (min %.3f) | %.2f TFLOPS | weights %.0f MB -> %.0f GB/s (active %.0f GB/s), +io %.0f MB | load max %d, experts hit %d, 32-col tiles %.0f (ideal %.0f)\n",
-           o.graph_reps, o.type.c_str(), (long long) o.m, (long long) o.k, (long long) o.n, o.nused, o.nmat, (int) o.bcast, o.skew,
+    printf("[x%d] %-7s m=%lld k=%lld n=%lld nused=%d nmat=%d bcast=%d skew=%.2f pool=%d | med %.3f ms (min %.3f) | %.2f TFLOPS | weights %.0f MB -> %.0f GB/s (active %.0f GB/s), +io %.0f MB | load max %d, experts hit %d, 32-col tiles %.0f (ideal %.0f)\n",
+           o.graph_reps, o.type.c_str(), (long long) o.m, (long long) o.k, (long long) o.n, o.nused, o.nmat, (int) o.bcast, o.skew, o.pool,
            med, mn, flops / (med * 1e-3) / 1e12, wbytes / 1e6, wbytes / (med * 1e-3) / 1e9, wactive / (med * 1e-3) / 1e9,
            obytes / 1e6, lmax, lnz, tiles32, (double) o.n * o.nused / 32);
 

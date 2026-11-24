@@ -2649,6 +2649,41 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
+    // GGML_CUDA_MMID_ROUTE_STATS=1: for small token batches, copy the routing to the host and
+    // accumulate, per (src0 type, shape, n_tokens): the number of distinct experts the batch touches and the
+    // tokens-per-expert histogram. Printed at exit. Synchronizes the stream, so only for measurements.
+    {
+        static const bool route_stats = [] { const char * e = getenv("GGML_CUDA_MMID_ROUTE_STATS"); return e && atoi(e) > 0; }();
+        if (route_stats && ne2 <= 32) {
+            struct acc { uint64_t n = 0, distinct = 0, tpe[33] = {0}; };
+            static std::map<std::string, acc> stats;
+            static struct printer { ~printer() {
+                for (const auto & kv : stats) {
+                    const acc & a = kv.second;
+                    std::string h;
+                    for (int t = 1; t <= 32; ++t) { if (a.tpe[t]) h += " " + std::to_string(t) + ":" + std::to_string(a.tpe[t]); }
+                    fprintf(stderr, "[mmid-route] %s | calls %llu | distinct experts avg %.2f | tokens-per-expert histogram (tokens:experts)%s\n",
+                            kv.first.c_str(), (unsigned long long) a.n, a.n ? (double) a.distinct / a.n : 0.0, h.c_str());
+                }
+            } } p;
+            std::vector<int32_t> ids_h((ggml_nbytes(ids) + sizeof(int32_t) - 1)/sizeof(int32_t)); // ids can be a strided view
+            CUDA_CHECK(cudaMemcpyAsync(ids_h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            std::vector<int> cnt(ne02, 0);
+            for (int64_t t = 0; t < ne2; ++t) {
+                for (int64_t s = 0; s < ids->ne[0]; ++s) {
+                    const int32_t e = ids_h[t*ids->nb[1]/sizeof(int32_t) + s*ids->nb[0]/sizeof(int32_t)];
+                    if (e >= 0 && e < ne02) { cnt[e]++; }
+                }
+            }
+            const std::string key = std::string(ggml_type_name(src0->type)) + " " + std::to_string(ne00) + "x" + std::to_string(ne01)
+                + "x" + std::to_string(ne02) + " n_tokens=" + std::to_string(ne2);
+            acc & a = stats[key];
+            a.n++;
+            for (int e = 0; e < ne02; ++e) { if (cnt[e]) { a.distinct++; a.tpe[std::min(cnt[e], 32)]++; } }
+        }
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
