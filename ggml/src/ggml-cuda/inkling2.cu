@@ -509,6 +509,95 @@ static __global__ void inkling2_conv_state_f32(const float * past_ptr, const flo
     dst_ptr[i] = res_ptr ? __fadd_rn(res_ptr[i], y) : y;
 }
 
+// Multi-token CONV_STATE / CONV_DYN for small batches (speculative-decoding verify): one thread per channel
+// and sequence computes all n_t tokens and reads every input before its first write. ggml-alloc puts dst in place of
+// r (and of cur, a transposed view of r); with one thread per (channel, token) that is a race, which is why the
+// chains above only matched in-place outputs for one token. GGML_CUDA_INKLING2_CONV_MT is a mask: bit 0 CONV_STATE
+// (bit-identical logits), bit 1 CONV_DYN (changes the logits of the model slightly, opt-in); default 1, 0 restores the
+// one-token matching. GGML_CUDA_INKLING2_CONV_MT_DEBUG=1 logs each new kind of launch once.
+static constexpr int INKLING2_CONV_MT_MAX_T = 32;
+
+static bool inkling2_conv_mt_enabled(const bool dyn = false) {
+    static const int mask = [] { const char * env = getenv("GGML_CUDA_INKLING2_CONV_MT"); return env ? atoi(env) : 1; }();
+    return (mask & (dyn ? 2 : 1)) != 0;
+}
+
+static void inkling2_conv_mt_debug(const bool dyn, const int64_t n_t, const ggml_tensor * dst, const ggml_tensor * cur,
+        const ggml_tensor * r, const ggml_tensor * res) {
+    static const bool debug = [] { const char * env = getenv("GGML_CUDA_INKLING2_CONV_MT_DEBUG"); return env && atoi(env) != 0; }();
+    if (!debug) {
+        return;
+    }
+    static bool seen[2][INKLING2_CONV_MT_MAX_T + 1][8] = {};
+    const int alias = (dst->data == cur->data ? 1 : 0) | (dst->data == r->data ? 2 : 0) | (res && dst->data == res->data ? 4 : 0);
+    if (!seen[dyn][n_t][alias]) {
+        seen[dyn][n_t][alias] = true;
+        fprintf(stderr, "inkling2_conv_mt: %s n_t=%d n_c=%d dst in place of: cur=%d r=%d res=%d\n", dyn ? "CONV_DYN" : "CONV_STATE",
+                (int) n_t, (int) dst->ne[0], alias & 1, (alias >> 1) & 1, (alias >> 2) & 1);
+    }
+}
+
+static __global__ void inkling2_conv_mt_f32(const float * past_ptr, const float * cur_ptr, const float * w_ptr,
+        const float * tap_ptr, const float * r_ptr, const float * res_ptr, float * cell_ptr, float * dst_ptr,
+        const int d_conv, const int64_t n_c, const int n_t, const int head_size, const int64_t n,
+        const int64_t past_s1, const int64_t past_s2, const int64_t cur_s0, const int64_t cur_s1, const int64_t cur_s2,
+        const int64_t w_s1, const int64_t tap_s1, const int64_t tap_s2, const int64_t cell_s1, const float s0, const float s1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t c = i % n_c;
+    const int64_t s = i / n_c;
+
+    // x = [past, cur] of this channel
+    float x[INKLING2_CONV_STATE_MAX_D - 1 + INKLING2_CONV_MT_MAX_T];
+    for (int k = 0; k < d_conv - 1; ++k) {
+        x[k] = past_ptr[s*past_s2 + c*past_s1 + k];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        x[d_conv - 1 + t] = cur_ptr[s*cur_s2 + c*cur_s1 + t*cur_s0];
+    }
+
+    const float * w = w_ptr + c*w_s1;
+    float y[INKLING2_CONV_MT_MAX_T];
+    for (int t = 0; t < n_t; ++t) {
+        const int64_t j = (s*n_t + t)*n_c + c;
+        // the order of ssm_conv_f32
+        float sum = 0.0f;
+        for (int k = 0; k < d_conv; ++k) {
+            sum += x[t + k]*w[k];
+        }
+        sum += 0.0f;
+        if (tap_ptr) {
+            // the taps, lag by lag: the window of lag l is x[t + d - 1 - l]
+            const float * tap = tap_ptr + (s*n_t + t)*tap_s2 + (c/head_size)*tap_s1;
+            for (int l = 0; l < d_conv; ++l) {
+                sum = __fadd_rn(sum, __fmul_rn(x[t + d_conv - 1 - l], tap[l]));
+            }
+        }
+        const float v = __fadd_rn(r_ptr[j], sum)*s0 + s1;
+        y[t] = res_ptr ? __fadd_rn(res_ptr[j], v) : v;
+    }
+
+    // the state keeps the last d_conv - 1 inputs
+    float * cell = cell_ptr + s*cell_s1 + c*(d_conv - 1);
+    for (int k = 0; k < d_conv - 1; ++k) {
+        cell[k] = x[n_t + k];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        dst_ptr[(s*n_t + t)*n_c + c] = y[t];
+    }
+}
+
+// dst in place of cur: the same elements at the same addresses
+static bool inkling2_conv_cur_inplace(const ggml_tensor * dst, const ggml_tensor * cur, const int64_t n_c, const int64_t n_t) {
+    return cur->data == dst->data && cur->nb[1] == sizeof(float) && cur->nb[2] == (size_t) (n_c*n_t)*sizeof(float) &&
+        (n_t == 1 || cur->nb[0] == (size_t) n_c*sizeof(float));
+}
+
 static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
     if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
                 GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE }, { i + 2, i + 3, i + 7 }) ||
@@ -548,8 +637,10 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != n_c*n_t*n_s) {
         return false;
     }
-    // with more than one token a thread reads the inputs of other tokens: dst may then not share memory with them
-    if (n_t > 1 && (inkling2_overlap(dst, cur) || inkling2_overlap(dst, r))) {
+    // with more than one token a thread of the per-element kernel reads the inputs of other tokens: dst may then not
+    // share memory with them. The per-channel kernel for small batches has no such limit.
+    const bool mt = n_t > 1 && n_t <= INKLING2_CONV_MT_MAX_T && inkling2_conv_mt_enabled();
+    if (n_t > 1 && !mt && (inkling2_overlap(dst, cur) || inkling2_overlap(dst, r))) {
         return false;
     }
     // the cell may not overlap any input, dst only the elements of r (and of cur, a view of r) it replaces
@@ -558,7 +649,7 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
             (inkling2_overlap(dst, r) && dst->data != r->data)) {
         return false;
     }
-    if (inkling2_overlap(dst, cur) && (cur->data != dst->data || cur->nb[1] != sizeof(float) || cur->nb[2] != dst->nb[1])) {
+    if (inkling2_overlap(dst, cur) && !inkling2_conv_cur_inplace(dst, cur, n_c, n_t)) {
         return false;
     }
 
@@ -567,11 +658,10 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
     ggml_tensor * scale = dst;
     if (res) {
         dst = cgraph->nodes[i + 8];
-        if ((n_t > 1 && (inkling2_overlap(dst, cur) || inkling2_overlap(dst, r))) ||
+        if ((n_t > 1 && !mt && (inkling2_overlap(dst, cur) || inkling2_overlap(dst, r))) ||
                 inkling2_overlap(dst, past) || inkling2_overlap(dst, w) || inkling2_overlap(dst, cpy) ||
                 (inkling2_overlap(dst, r) && dst->data != r->data) || !inkling2_same_or_disjoint(dst, res) ||
-                (inkling2_overlap(dst, cur) && (cur->data != dst->data || cur->nb[1] != sizeof(float) ||
-                    cur->nb[2] != dst->nb[1])) || inkling2_overlap(res, cpy)) {
+                (inkling2_overlap(dst, cur) && !inkling2_conv_cur_inplace(dst, cur, n_c, n_t)) || inkling2_overlap(res, cpy)) {
             return false;
         }
     }
@@ -607,9 +697,23 @@ static void inkling2_conv_state(ggml_backend_cuda_context & ctx, const ggml_cuda
     const int64_t n   = n_c*n_t*x->ne[2];
     const int     bs  = 256;
 
-    const ggml_cuda_kernel_launch_params params(dim3((n + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
     const ggml_tensor * scale = args.node[2];
     const ggml_tensor * res   = args.node[3];
+    if (n_t > 1 && n_t <= INKLING2_CONV_MT_MAX_T && inkling2_conv_mt_enabled()) {
+        const int64_t n_cs = n_c*x->ne[2];
+        inkling2_conv_mt_debug(false, n_t, args.dst, cur, r, res);
+        const ggml_cuda_kernel_launch_params params_mt(dim3((n_cs + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
+        ggml_cuda_kernel_launch(inkling2_conv_mt_f32, params_mt, (const float *) past->data, (const float *) cur->data,
+                (const float *) w->data, (const float *) nullptr, (const float *) r->data,
+                (const float *) (res ? res->data : nullptr), (float *) cpy->data, (float *) args.dst->data,
+                (int) w->ne[0], n_c, (int) n_t, 1, n_cs,
+                (int64_t) (past->nb[1]/sizeof(float)), (int64_t) (past->nb[2]/sizeof(float)), (int64_t) (cur->nb[0]/sizeof(float)),
+                (int64_t) (cur->nb[1]/sizeof(float)), (int64_t) (cur->nb[2]/sizeof(float)), (int64_t) (w->nb[1]/sizeof(float)),
+                (int64_t) 0, (int64_t) 0,
+                (int64_t) (cpy->nb[1]/sizeof(float)), ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1));
+        return;
+    }
+    const ggml_cuda_kernel_launch_params params(dim3((n + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(inkling2_conv_state_f32, params, (const float *) past->data, (const float *) cur->data,
             (const float *) w->data, (const float *) r->data, (const float *) (res ? res->data : nullptr), (float *) cpy->data,
             (float *) args.dst->data, (int) w->ne[0], n_c, n_t, n,
@@ -698,8 +802,12 @@ static bool inkling2_match_conv_dyn(const ggml_cgraph * cgraph, int i, ggml_cuda
     const int64_t       n_c    = x->ne[1];
     const int64_t       n_s    = x->ne[2];
 
-    if (d_conv < 2 || d_conv > INKLING2_CONV_STATE_MAX_D || x->ne[0] != d_conv) {
-        return false; // one token per sequence only
+    if (d_conv < 2 || d_conv > INKLING2_CONV_STATE_MAX_D || x->ne[0] < d_conv) {
+        return false;
+    }
+    const int64_t n_t = x->ne[0] - (d_conv - 1);
+    if (n_t > 1 && (n_t > INKLING2_CONV_MT_MAX_T || !inkling2_conv_mt_enabled(true))) {
+        return false; // the per-element kernel: one token per sequence only
     }
 
     // the taps, lag by lag
@@ -713,7 +821,7 @@ static bool inkling2_match_conv_dyn(const ggml_cgraph * cgraph, int i, ggml_cuda
         }
         const ggml_tensor * win = nodes[j];
         if (win->op != GGML_OP_VIEW || win->src[0] != x || win->view_offs != (d_conv - 1 - lag)*sizeof(float) ||
-                win->ne[0] != 1 || win->ne[1] != n_c || win->ne[2] != n_s || win->nb[1] != x->nb[1] || win->nb[2] != x->nb[2] ||
+                win->ne[0] != n_t || win->ne[1] != n_c || win->ne[2] != n_s || win->nb[1] != x->nb[1] || win->nb[2] != x->nb[2] ||
                 nodes[j + 1]->op != GGML_OP_TRANSPOSE || nodes[j + 1]->src[0] != win ||
                 nodes[j + 2]->op != GGML_OP_CONT || nodes[j + 2]->src[0] != nodes[j + 1] ||
                 nodes[j + 3]->op != GGML_OP_RESHAPE || nodes[j + 3]->src[0] != nodes[j + 2]) {
@@ -734,7 +842,7 @@ static bool inkling2_match_conv_dyn(const ggml_cgraph * cgraph, int i, ggml_cuda
         if (tap->op != GGML_OP_VIEW || tap->src[0] != taps || tap->view_offs != lag*sizeof(float) ||
                 tap->ne[0] != 1 || tap->ne[1] != taps->ne[1] || tap->ne[2] != taps->ne[2] || tap->nb[1] != taps->nb[1] ||
                 tap->nb[2] != taps->nb[2] || nodes[j + 3]->ne[0] != n_c/taps->ne[1] || nodes[j + 3]->ne[1] != taps->ne[1] ||
-                nodes[j + 3]->ne[2] != n_s ||
+                nodes[j + 3]->ne[2] != n_s*n_t ||
                 mul->op != GGML_OP_MUL || mul->src[0] != nodes[j + 3] || mul->src[1] != tap ||
                 term->op != GGML_OP_RESHAPE || term->src[0] != mul ||
                 add->op != GGML_OP_ADD || add->src[0] != out || add->src[1] != term) {
@@ -782,15 +890,15 @@ static bool inkling2_match_conv_dyn(const ggml_cgraph * cgraph, int i, ggml_cuda
     const int64_t n_heads = taps->ne[1];
     if (ggml_get_op_params_i32(x, 0) != 0 || x->type != GGML_TYPE_F32 || x->ne[3] != 1 || !inkling2_is_f32_rows(w) ||
             w->ne[1] != n_c || past->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) || past->ne[0] != d_conv - 1 ||
-            cur->type != GGML_TYPE_F32 || cur->ne[0] != 1 ||
-            last_v->ne[0] != d_conv - 1 || last_v->ne[1] != n_c || last_v->ne[2] != n_s || last_v->view_offs != sizeof(float) ||
+            cur->type != GGML_TYPE_F32 || cur->ne[0] != n_t ||
+            last_v->ne[0] != d_conv - 1 || last_v->ne[1] != n_c || last_v->ne[2] != n_s || last_v->view_offs != n_t*sizeof(float) ||
             last_v->nb[1] != x->nb[1] || last_v->nb[2] != x->nb[2] ||
             cpy->type != GGML_TYPE_F32 || cpy->nb[0] != sizeof(float) || cpy->ne[0] != (d_conv - 1)*n_c || cpy->ne[1] != n_s ||
             cpy->ne[2] != 1 || cpy->ne[3] != 1 ||
             taps->type != GGML_TYPE_F32 || !ggml_is_contiguous(taps) || taps->ne[0] != d_conv || n_heads <= 0 ||
-            n_c % n_heads != 0 || taps->ne[2] != n_s || taps->ne[3] != 1 ||
-            r->type != GGML_TYPE_F32 || !ggml_is_contiguous(r) || ggml_nelements(r) != n_c*n_s ||
-            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != n_c*n_s) {
+            n_c % n_heads != 0 || taps->ne[2] != n_s*n_t || taps->ne[3] != 1 ||
+            r->type != GGML_TYPE_F32 || !ggml_is_contiguous(r) || ggml_nelements(r) != n_c*n_s*n_t ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != n_c*n_s*n_t) {
         return false;
     }
     if (inkling2_overlap(cpy, past) || inkling2_overlap(cpy, cur) || inkling2_overlap(cpy, w) || inkling2_overlap(cpy, r) ||
@@ -798,7 +906,7 @@ static bool inkling2_match_conv_dyn(const ggml_cgraph * cgraph, int i, ggml_cuda
             inkling2_overlap(dst, w) || inkling2_overlap(dst, taps) || (inkling2_overlap(dst, r) && dst->data != r->data)) {
         return false;
     }
-    if (inkling2_overlap(dst, cur) && (cur->data != dst->data || cur->nb[1] != sizeof(float) || cur->nb[2] != dst->nb[1])) {
+    if (inkling2_overlap(dst, cur) && !inkling2_conv_cur_inplace(dst, cur, n_c, n_t)) {
         return false;
     }
     if (n_c % n_heads != 0 || !inkling2_outside(cgraph, i, count, { past, cur, w, r, taps->src[0] })) {
@@ -832,6 +940,18 @@ static void inkling2_conv_dyn(ggml_backend_cuda_context & ctx, const ggml_cuda_i
     const int     bs  = 256;
 
     const ggml_cuda_kernel_launch_params params(dim3((n + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
+    const int64_t n_t = x->ne[0] - (w->ne[0] - 1);
+    if (n_t > 1) {
+        inkling2_conv_mt_debug(true, n_t, args.dst, cur, r, nullptr);
+        ggml_cuda_kernel_launch(inkling2_conv_mt_f32, params, (const float *) past->data, (const float *) cur->data,
+                (const float *) w->data, (const float *) taps->data, (const float *) r->data, (const float *) nullptr,
+                (float *) cpy->data, (float *) args.dst->data, (int) w->ne[0], n_c, (int) n_t, (int) (n_c/taps->ne[1]), n,
+                (int64_t) (past->nb[1]/sizeof(float)), (int64_t) (past->nb[2]/sizeof(float)), (int64_t) (cur->nb[0]/sizeof(float)),
+                (int64_t) (cur->nb[1]/sizeof(float)), (int64_t) (cur->nb[2]/sizeof(float)), (int64_t) (w->nb[1]/sizeof(float)),
+                (int64_t) (taps->nb[1]/sizeof(float)), (int64_t) (taps->nb[2]/sizeof(float)),
+                (int64_t) (cpy->nb[1]/sizeof(float)), ggml_get_op_params_f32(args.dst, 0), ggml_get_op_params_f32(args.dst, 1));
+        return;
+    }
     ggml_cuda_kernel_launch(inkling2_conv_dyn_f32, params, (const float *) past->data, (const float *) cur->data,
             (const float *) w->data, (const float *) taps->data, (const float *) r->data, (float *) cpy->data,
             (float *) args.dst->data, (int) w->ne[0], n_c, (int) (n_c/taps->ne[1]), n,

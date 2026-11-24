@@ -3920,6 +3920,9 @@ struct test_inkling2 : public test_case {
                             // TABLE: bins of the bias (the relative extent),
                             // CONV_DYN: heads, CONV(_STATE): a residual add follows
 
+    const bool       computed_input; // CONV_STATE, CONV_DYN: the input is an op output, as in the model, so that the
+                                     // allocator may put the chain output in place of it
+
     ggml_tensor * state_store = nullptr; // CONV_STATE: the state store, compared along with the output
 
     static constexpr int64_t n_expert = 16;
@@ -3932,7 +3935,7 @@ struct test_inkling2 : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n, n_tok, k, v);
+        return VARS_TO_STR5(n, n_tok, k, v, computed_input);
     }
 
     bool run_whole_graph() override { return true; }
@@ -3951,8 +3954,8 @@ struct test_inkling2 : public test_case {
         return chain == MIX || chain == CTRL || chain == RELBIAS || chain == TABLE ? 5e-4 : 1e-6;
     }
 
-    test_inkling2(chain_type chain, int64_t n, int64_t n_tok, int64_t k, int64_t v)
-        : chain(chain), n(n), n_tok(n_tok), k(k), v(v) {}
+    test_inkling2(chain_type chain, int64_t n, int64_t n_tok, int64_t k, int64_t v, bool computed_input = false)
+        : chain(chain), n(n), n_tok(n_tok), k(k), v(v), computed_input(computed_input) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = nullptr;
@@ -4108,6 +4111,10 @@ struct test_inkling2 : public test_case {
                 ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*n + 5, n_seqs + 1);
                 ggml_set_name(cur, "cur");
                 ggml_set_name(cache, "cache");
+                if (computed_input) {
+                    cur = ggml_scale(ctx, ggml_add(ctx, cur, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok*n_seqs)), 0.5f);
+                    ggml_build_forward_expand(gf, cur);
+                }
                 ggml_tensor * x = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n, n_tok, n_seqs));
                 x = ggml_concat(ctx, past, x, 0);
                 ggml_tensor * last = ggml_view_3d(ctx, x, d_conv - 1, n, n_seqs, x->nb[1], x->nb[2], n_tok*ggml_element_size(x));
@@ -4119,14 +4126,14 @@ struct test_inkling2 : public test_case {
                 if (chain == CONV_DYN) {
                     // input-dependent taps per head, as the full-attention K and V convolutions
                     const int64_t n_heads = v;
-                    ggml_tensor * dyn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv*n_heads, n_seqs);
+                    ggml_tensor * dyn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv*n_heads, n_tok*n_seqs);
                     ggml_set_name(dyn, "taps");
-                    ggml_tensor * taps = ggml_reshape_3d(ctx, dyn, d_conv, n_heads, n_seqs);
+                    ggml_tensor * taps = ggml_reshape_3d(ctx, dyn, d_conv, n_heads, n_tok*n_seqs);
                     for (int64_t lag = 0; lag < d_conv; ++lag) {
-                        ggml_tensor * tap    = ggml_view_3d(ctx, taps, 1, n_heads, n_seqs, taps->nb[1], taps->nb[2], lag*taps->nb[0]);
-                        ggml_tensor * window = ggml_view_3d(ctx, x, 1, n, n_seqs, x->nb[1], x->nb[2], (d_conv - 1 - lag)*x->nb[0]);
-                        window = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, window)), n/n_heads, n_heads, n_seqs);
-                        y = ggml_add(ctx, y, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n, n_seqs));
+                        ggml_tensor * tap    = ggml_view_3d(ctx, taps, 1, n_heads, n_tok*n_seqs, taps->nb[1], taps->nb[2], lag*taps->nb[0]);
+                        ggml_tensor * window = ggml_view_3d(ctx, x, n_tok, n, n_seqs, x->nb[1], x->nb[2], (d_conv - 1 - lag)*x->nb[0]);
+                        window = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, window)), n/n_heads, n_heads, n_tok*n_seqs);
+                        y = ggml_add(ctx, y, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n, n_tok*n_seqs));
                     }
                 }
                 out = ggml_scale(ctx, ggml_add(ctx, cur, y), 1.0f/sqrtf((chain == CONV_DYN ? 2 : 1)*d_conv + 1));
@@ -12454,6 +12461,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE,  256, 5, 3, 1));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,   1024, 1, 1, 8));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,    256, 1, 3, 2));
+    // small batches (speculative-decoding verify): the per-channel kernel, in-place outputs
+    for (int64_t n_tok : { 2, 4, 8, 16, 32, 33 }) {
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, n_tok, 1, 0));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, n_tok, 1, 1));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,   2304, n_tok, 1, 8));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, n_tok, 1, 0, true));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, n_tok, 1, 1, true));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,   2304, n_tok, 1, 8, true));
+    }
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE, 2304, 1, 1, 0, true));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,   2304, 1, 1, 8, true));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE,  256, 6, 3, 1, true));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,    256, 5, 3, 2, true));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_STATE,  256, 6, 3, 1));
+    test_cases.emplace_back(new test_inkling2(test_inkling2::CONV_DYN,    256, 5, 3, 2));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 256, 3, 4, 0));
     test_cases.emplace_back(new test_inkling2(test_inkling2::MIX,  96, 3, 3, 2));
     test_cases.emplace_back(new test_inkling2(test_inkling2::CTRL, 96, 3, 8, 0));
