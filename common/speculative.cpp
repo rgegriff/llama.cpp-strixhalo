@@ -1379,6 +1379,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
     // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
     bool has_markov_context = false;
+    // fork: a draft without a confidence head (Inkling2) cuts its block on the top token's probability instead
+    bool has_conf_head = true;
     size_t ctx_rows = 0;
     std::vector<float>     ctx_embd;
     std::vector<llama_pos> ctx_pos;
@@ -1418,8 +1420,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const bool has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
+            has_conf_head = has_conf;
             if (!has_conf) {
-                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+                LOG_INF("%s: DSpark draft has no confidence head: --spec-draft-p-min %.2f cuts drafts on the top token's probability\n",
+                        __func__, (double) this->params.p_min);
             }
         }
 
@@ -1598,7 +1602,7 @@ public:
             }
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
-            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            const float * conf = params.p_min > 0.0f && has_conf_head ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                 const int32_t idx = beg + i;
 
@@ -1614,6 +1618,10 @@ public:
                     LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
+
+                if (!has_conf_head && params.p_min > 0.0f && cur_p->data[0].p < params.p_min) {
+                    break;
                 }
 
                 const llama_token id = cur_p->data[0].id;
