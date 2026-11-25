@@ -46,6 +46,9 @@ All are environment variables read once per process. Unset means the default.
 | variable | default | effect | to disable |
 |---|---|---|---|
 | `GGML_CUDA_INKLING2_FUSION` | on | fuse the Inkling 2 glue-op chains (clip, short conv + state store, SiTU, depth mix, loop controller, bias table) into single kernels | `=0` |
+| `GGML_CUDA_INKLING2_SITU_PLAIN` | on | fuse the SiTU chain of models without a per-expert scale (Inkling 2 Mini): 8 dispatches per layer visit become 1 | `=0` |
+| `GGML_CUDA_TOPK_MOE_NORM_EPS` | on | the top-k MoE router kernel also takes the weight normalization by `sum + eps` (`expert_weights_norm_eps`), not only the clamped sum | `=0` |
+| `GGML_CUDA_MMVQ_Q8_CACHE` | on | consecutive quantized matrix-vector products that read the same activations (the projections of an attention block) quantize them to Q8_1 once; bit-identical | `=0` |
 | `GGML_CUDA_INKLING2_CONV_MT` | `1` | bit mask for the short-conv fusion on 2..32-token batches (speculative-decoding verify): bit 0 `CONV_STATE` (bit-identical), bit 1 `CONV_DYN` (opt-in: changes the logits slightly, KL ~0.004, cause not identified). `3` enables both | `=0` |
 | `GGML_CUDA_FATTN_INKLING` | on | one-query decode attention over a q8_0/q4_0 KV cache with the indexed bias, contexts of `GGML_CUDA_FATTN_INKLING_MIN_KV` (65536) keys and more | `=0` |
 | `GGML_CUDA_FATTN_INKLING_SMALL` | on | the same for 2..16 queries (speculative-decoding verify), from `GGML_CUDA_FATTN_INKLING_SMALL_MIN_KV` (32768) keys | `=0` |
@@ -56,6 +59,8 @@ All are environment variables read once per process. Unset means the default.
 | `GGML_CUDA_MMID_Q8_MMQ_MIN` | `4` | RDNA 3.5: Q8_0 `MUL_MAT_ID` goes to MMQ from this many tokens (MMVQ below) | `=0` (stock table) |
 | `LLAMA_INKLING_KV_ROT` | off | experiment: Hadamard rotation of Q/K (bit 1) and V (bit 2) ahead of the KV cache | leave unset |
 | `GGML_CUDA_OP_STATS` | off | `1`: count dispatched ops and fused chains per graph evaluation; `2`: also synchronize and time each kind of op (slow) | leave unset |
+| `GGML_CUDA_OP_STATS_SHAPES`, `GGML_CUDA_OP_STATS_TRACE` | off | with `GGML_CUDA_OP_STATS`: key the matmul and attention ops by shape at level 1 too; `TRACE=<n>` prints one line per dispatch of graph evaluation n. While a HIP graph is captured the stats also count the kernels each op launches | leave unset |
+| `GGML_CUDA_STEP_TIMING` | off | `1`: one line per graph evaluation with its mode (direct, capture, replay), the host time to enqueue it and the time the stream needs to drain; synchronizes around every evaluation | leave unset |
 | `GGML_CUDA_MMID_ROUTE_STATS` | off | `1`: per-shape histogram of experts touched by small `MUL_MAT_ID` batches, printed at exit (synchronizes the stream) | leave unset |
 | `GGML_CUDA_FATTN_INKLING_DEBUG`, `GGML_CUDA_INKLING_MOE_DEBUG`, `GGML_CUDA_INKLING2_CONV_MT_DEBUG` | off | log which calls the dedicated kernels take or reject | leave unset |
 
