@@ -1494,6 +1494,40 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // The Q8_1 quantization of the activations of the last quantized matrix-vector product. Consecutive products
+    // with the same activations (the projections of an attention block read one normalized vector) then quantize
+    // them once: at batch size 1 a product is two tiny kernels and their launches are what it costs.
+    // GGML_CUDA_MMVQ_Q8_CACHE=0 turns it off.
+    struct q8_1_cache_t {
+        static constexpr size_t buf_size = 256 * 1024;
+
+        char * buf   = nullptr; // device memory, allocated once and never moved: captured CUDA graphs refer to it
+        bool   valid = false;
+
+        // what was quantized
+        const void * data      = nullptr;
+        size_t       nbytes    = 0;
+        int          stream_no = 0;
+        int64_t      ne[GGML_MAX_DIMS] = {};
+        size_t       nb[GGML_MAX_DIMS] = {};
+    } q8_1_cache;
+
+    // The buffer for the quantization of src1 (size bytes), nullptr when it is not cached.
+    // hit: the buffer already holds it, otherwise the caller quantizes into it.
+    char * q8_1_cache_get(const ggml_tensor * src1, size_t size, bool & hit);
+
+    // a node was computed: forget the cached quantization of anything it wrote over
+    void q8_1_cache_written(const ggml_tensor * node) {
+        if (!q8_1_cache.valid || node->data == nullptr) {
+            return;
+        }
+        const char * n0 = (const char *) node->data;
+        const char * c0 = (const char *) q8_1_cache.data;
+        if (n0 < c0 + q8_1_cache.nbytes && c0 < n0 + ggml_nbytes(node)) {
+            q8_1_cache.valid = false;
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {

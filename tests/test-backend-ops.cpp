@@ -3906,6 +3906,62 @@ struct test_softcap : public test_case {
     }
 };
 
+// Quantized matrix-vector products that read the same activations, as the projections of an attention block do.
+// A backend may quantize the activations once (CUDA: the Q8_1 cache of mmvq); with rewrite, the activations are
+// changed in place between the products, which has to drop what was kept of them.
+struct test_mul_mat_vec_shared : public test_case {
+    const ggml_type type_a;
+    const int64_t   k;
+    const int64_t   n_tok;
+    const bool      rewrite;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_SHARED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, k, n_tok, rewrite);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4; // same as test_mul_mat
+    }
+
+    test_mul_mat_vec_shared(ggml_type type_a, int64_t k, int64_t n_tok, bool rewrite)
+        : type_a(type_a), k(k), n_tok(n_tok), rewrite(rewrite) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, 96);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_a, k, 160);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type_a, k, 32);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+        ggml_set_name(a2, "a2");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tok);
+        ggml_set_name(x, "x");
+        // the activations are an op output in a model
+        x = ggml_scale_bias(ctx, x, 0.5f, 0.25f);
+
+        ggml_tensor * y0 = ggml_mul_mat(ctx, a0, x);
+        ggml_tensor * y1 = ggml_mul_mat(ctx, a1, x);
+        ggml_build_forward_expand(gf, y0);
+        ggml_build_forward_expand(gf, y1);
+
+        if (rewrite) {
+            x = ggml_scale_bias_inplace(ctx, x, -1.5f, 0.125f);
+        }
+        ggml_tensor * y2 = ggml_mul_mat(ctx, a2, x);
+
+        ggml_tensor * out = ggml_concat(ctx, ggml_concat(ctx, y0, y1, 0), y2, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Inkling 2: the glue op chains of src/models/inkling2.cpp, built in the same op order as the model, so that a
 // backend that fuses them (CUDA, inkling2.cu) is compared against the unfused CPU ops
 struct test_inkling2 : public test_case {
@@ -12432,6 +12488,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1)); // view test, inplace
     test_cases.emplace_back(new test_scale(GGML_TYPE_F16, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n_tok : { 1, 4 }) {
+            for (bool rewrite : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_vec_shared(type_a, 2304, n_tok, rewrite));
+            }
+        }
+    }
     // Inkling 2 glue chains (inkling2.cu)
     for (int64_t n_tok : { 1, 7, 512 }) {
         // the shapes of Inkling 2 Mini

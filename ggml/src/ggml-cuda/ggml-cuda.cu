@@ -995,6 +995,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_cache.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(q8_1_cache.buf));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1015,6 +1019,43 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 }
 
+
+char * ggml_backend_cuda_context::q8_1_cache_get(const ggml_tensor * src1, const size_t size, bool & hit) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_Q8_CACHE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    hit = false;
+    if (!enabled || size > q8_1_cache_t::buf_size || src1->data == nullptr) {
+        return nullptr;
+    }
+
+    q8_1_cache_t & c = q8_1_cache;
+
+    if (c.buf == nullptr) {
+        void * ptr = nullptr;
+        if (ggml_cuda_device_malloc(&ptr, q8_1_cache_t::buf_size, device) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        c.buf = (char *) ptr;
+    }
+
+    if (c.valid && c.data == src1->data && c.stream_no == curr_stream_no &&
+            memcmp(c.ne, src1->ne, sizeof(c.ne)) == 0 && memcmp(c.nb, src1->nb, sizeof(c.nb)) == 0) {
+        hit = true;
+        return c.buf;
+    }
+
+    c.valid     = true;
+    c.data      = src1->data;
+    c.nbytes    = ggml_nbytes(src1);
+    c.stream_no = curr_stream_no;
+    memcpy(c.ne, src1->ne, sizeof(c.ne));
+    memcpy(c.nb, src1->nb, sizeof(c.nb));
+    return c.buf;
+}
 
 // cuda buffer
 
@@ -5637,6 +5678,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+            // the tensors were written since the last evaluation
+            cuda_ctx->q8_1_cache.valid = false;
+
             if (ggml_cuda_get_op_stats().enabled) {
                 std::lock_guard<std::mutex> lock(ggml_cuda_get_op_stats().mutex);
                 ggml_cuda_get_op_stats().n_graphs++;
@@ -5797,6 +5841,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (op_stats.enabled) {
                         op_stats.add_fused(cgraph, i, nodes_to_skip, op_time_us(), op_kernels());
                     }
+                    for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        cuda_ctx->q8_1_cache_written(cgraph->nodes[k]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5828,6 +5875,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                cuda_ctx->q8_1_cache_written(node);
 
                 if (op_stats.enabled) {
                     op_stats.add_op(node, op_time_us(), op_kernels());
