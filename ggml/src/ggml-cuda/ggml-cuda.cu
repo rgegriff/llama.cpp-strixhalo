@@ -3351,11 +3351,14 @@ struct ggml_cuda_op_stats {
     const int  level   = [] { const char * env = getenv("GGML_CUDA_OP_STATS"); return env ? atoi(env) : 0; }();
     const bool enabled = level > 0;
     const bool timing  = level > 1;
+    const bool shapes  = getenv("GGML_CUDA_OP_STATS_SHAPES") != nullptr; // key the matmul and attention ops by shape at level 1 too
 
     struct entry {
         uint64_t count    = 0;
         uint64_t replaced = 0; // fused chains: the ops they stand for
         int64_t  t_us     = 0;
+        uint64_t captured = 0; // dispatches seen while a CUDA graph was being captured
+        uint64_t kernels  = 0; // kernel nodes those dispatches added to the captured graph
     };
 
     std::mutex mutex;
@@ -3375,20 +3378,43 @@ struct ggml_cuda_op_stats {
 
     std::string key(const ggml_tensor * node) const {
         std::string k = ggml_op_desc(node);
-        if (timing && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_FLASH_ATTN_EXT)) {
+        if ((timing || shapes) && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_FLASH_ATTN_EXT)) {
             k += " [" + shape(node->src[0]) + "] [" + shape(node->src[1]) + "]";
         }
         return k;
     }
 
-    void add_op(const ggml_tensor * node, int64_t t_us) {
+    // GGML_CUDA_OP_STATS_TRACE=<n>: one line per dispatch of graph evaluation n (1 = the first one counted)
+    const uint64_t trace_graph = [] { const char * env = getenv("GGML_CUDA_OP_STATS_TRACE"); return env ? (uint64_t) atoll(env) : 0; }();
+
+    void trace(const ggml_tensor * node, int nodes_to_skip, const ggml_tensor * last, int64_t n_kernels) const {
+        if (!enabled || trace_graph == 0 || n_graphs != trace_graph) {
+            return;
+        }
+        fprintf(stderr, "ggml_cuda_op_trace: %-10s +%-2d k%-2" PRId64 " %-28s [%s]", ggml_op_desc(node), nodes_to_skip, n_kernels, node->name, shape(node).c_str());
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j] != nullptr; ++j) {
+            fprintf(stderr, " <- %s [%s]", node->src[j]->name, shape(node->src[j]).c_str());
+        }
+        if (last != node) {
+            fprintf(stderr, " ... %s %s [%s]", ggml_op_desc(last), last->name, shape(last).c_str());
+        }
+        fprintf(stderr, "\n");
+    }
+
+    void add_op(const ggml_tensor * node, int64_t t_us, int64_t n_kernels) {
+        trace(node, 0, node, n_kernels);
         std::lock_guard<std::mutex> lock(mutex);
         entry & e = ops[key(node)];
         e.count++;
         e.t_us += t_us;
+        if (n_kernels >= 0) {
+            e.captured++;
+            e.kernels += n_kernels;
+        }
     }
 
-    void add_fused(const ggml_cgraph * cgraph, int i, int nodes_to_skip, int64_t t_us) {
+    void add_fused(const ggml_cgraph * cgraph, int i, int nodes_to_skip, int64_t t_us, int64_t n_kernels) {
+        trace(cgraph->nodes[i], nodes_to_skip, cgraph->nodes[i + nodes_to_skip], n_kernels);
         uint64_t n_ops = 0;
         for (int k = i; k <= i + nodes_to_skip; ++k) {
             n_ops += !ggml_cuda_is_view_or_noop(cgraph->nodes[k]);
@@ -3398,6 +3424,10 @@ struct ggml_cuda_op_stats {
         e.count++;
         e.replaced += n_ops;
         e.t_us += t_us;
+        if (n_kernels >= 0) {
+            e.captured++;
+            e.kernels += n_kernels;
+        }
     }
 
     ~ggml_cuda_op_stats() {
@@ -3426,12 +3456,18 @@ struct ggml_cuda_op_stats {
             if (timing) {
                 fprintf(stderr, " %10.3f ms %8.2f us each", e.t_us/n/1000.0, double(e.t_us)/e.count);
             }
+            if (e.captured > 0) {
+                fprintf(stderr, "  %.2f kernels each", double(e.kernels)/e.captured);
+            }
             fprintf(stderr, "\n");
         }
         for (const auto & [name, e] : fused) {
             fprintf(stderr, "ggml_cuda_op_stats:   fused %-64s %9.1f", name.c_str(), e.count/n);
             if (timing) {
                 fprintf(stderr, " %10.3f ms %8.2f us each", e.t_us/n/1000.0, double(e.t_us)/e.count);
+            }
+            if (e.captured > 0) {
+                fprintf(stderr, "  %.2f kernels each", double(e.kernels)/e.captured);
             }
             fprintf(stderr, "  (replaces %.1f ops)\n", e.replaced/n);
         }
@@ -3603,6 +3639,17 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
     }
 }
 
+// GGML_CUDA_STEP_TIMING=1: one line per graph evaluation with the host time to enqueue it and the time the stream
+// then needs to drain (the evaluation is synchronized, so the numbers of the steps do not overlap)
+static bool ggml_cuda_step_timing_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_STEP_TIMING");
+    return enabled;
+}
+
+// kernel and total nodes of the CUDA graphs captured for the last evaluation
+static size_t ggml_cuda_step_timing_kernels = 0;
+static size_t ggml_cuda_step_timing_nodes   = 0;
+
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
 static int ggml_cuda_graph_chunk_size() {
     static const int chunk_size = [] {
@@ -3616,6 +3663,19 @@ static int ggml_cuda_graph_chunk_size() {
 static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
     cudaGraph_t cuda_graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+
+    if (ggml_cuda_step_timing_enabled()) {
+        size_t n_nodes = 0;
+        CUDA_CHECK(cudaGraphGetNodes(cuda_graph, nullptr, &n_nodes));
+        std::vector<cudaGraphNode_t> nodes(n_nodes);
+        CUDA_CHECK(cudaGraphGetNodes(cuda_graph, nodes.data(), &n_nodes));
+        for (size_t i = 0; i < n_nodes; ++i) {
+            cudaGraphNodeType type;
+            CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
+            ggml_cuda_step_timing_kernels += type == cudaGraphNodeTypeKernel;
+        }
+        ggml_cuda_step_timing_nodes += n_nodes;
+    }
 
     if (idx < graph->instances.size()) {
         ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
@@ -5684,11 +5744,35 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     return ggml_time_us() - t_op_start;
                 };
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+                // nodes of the CUDA graph under capture, -1 when nothing is captured or counted
+                const auto captured_nodes = [&]() -> int64_t {
+                    if (!op_stats.enabled || !use_cuda_graph || !cuda_graph_update_required) {
+                        return -1;
+                    }
+                    hipStreamCaptureStatus status;
+                    cudaGraph_t            capture_graph = nullptr;
+                    size_t                  n_capture     = 0;
+                    CUDA_CHECK(hipStreamGetCaptureInfo_v2(cuda_ctx->stream(), &status, nullptr, &capture_graph, nullptr, nullptr));
+                    if (capture_graph == nullptr) {
+                        return -1;
+                    }
+                    CUDA_CHECK(cudaGraphGetNodes(capture_graph, nullptr, &n_capture));
+                    return (int64_t) n_capture;
+                };
+                const int64_t n_captured_before = captured_nodes();
+                const auto op_kernels = [&]() -> int64_t {
+                    return n_captured_before < 0 ? -1 : captured_nodes() - n_captured_before;
+                };
+#else
+                const auto op_kernels = []() -> int64_t { return -1; };
+#endif // USE_CUDA_GRAPH && GGML_USE_HIP
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
                     if (op_stats.enabled) {
-                        op_stats.add_fused(cgraph, i, nodes_to_skip, op_time_us());
+                        op_stats.add_fused(cgraph, i, nodes_to_skip, op_time_us(), op_kernels());
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5723,7 +5807,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_ASSERT(ok);
 
                 if (op_stats.enabled) {
-                    op_stats.add_op(node, op_time_us());
+                    op_stats.add_op(node, op_time_us(), op_kernels());
                 }
 
                 if (!is_concurrent_event_active) {
@@ -5835,6 +5919,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+#ifdef USE_CUDA_GRAPH
+    const bool step_timing = ggml_cuda_step_timing_enabled();
+    int64_t t_step_start = 0;
+    if (step_timing) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_cuda_step_timing_kernels = 0;
+        ggml_cuda_step_timing_nodes   = 0;
+        t_step_start = ggml_time_us();
+    }
+#endif // USE_CUDA_GRAPH
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5846,6 +5941,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    if (step_timing) {
+        const int64_t t_enqueued = ggml_time_us();
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        const int64_t t_done = ggml_time_us();
+        const char * mode = !use_cuda_graph ? "direct" : cuda_graph_update_required ? "capture" : "replay";
+        fprintf(stderr, "ggml_cuda_step_timing: %-7s nodes %6d enqueue %8.3f ms drain %8.3f ms total %8.3f ms",
+                mode, cgraph->n_nodes, (t_enqueued - t_step_start)/1000.0, (t_done - t_enqueued)/1000.0, (t_done - t_step_start)/1000.0);
+        if (use_cuda_graph && cuda_graph_update_required) {
+            fprintf(stderr, " captured %zu kernels in %zu graph nodes, %zu graphs", ggml_cuda_step_timing_kernels, ggml_cuda_step_timing_nodes,
+                    cuda_ctx->cuda_graph(graph_key)->instances.size());
+        }
+        fprintf(stderr, "\n");
+    }
+#endif // USE_CUDA_GRAPH
 
     return GGML_STATUS_SUCCESS;
 }
