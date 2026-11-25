@@ -8,7 +8,7 @@ enum ggml_cuda_inkling2_fusion {
     GGML_CUDA_INKLING2_NONE,
     GGML_CUDA_INKLING2_CLIP,       // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL  : row L2 clip
     GGML_CUDA_INKLING2_CONV,       // SSM_CONV RESHAPE ADD SCALE [ADD]                  : short conv + residuals
-    GGML_CUDA_INKLING2_SITU,       // [REPEAT GET_ROWS] MUL VIEW SCALE TANH ... MUL     : SiTU of the expert gate/up
+    GGML_CUDA_INKLING2_SITU,       // [[REPEAT GET_ROWS] MUL VIEW] SCALE TANH ... MUL   : SiTU of the expert gate/up
     GGML_CUDA_INKLING2_MIX,        // RMS_NORM CONCAT TRANSPOSE CONT ... MUL_MAT        : attention over depth
     GGML_CUDA_INKLING2_CTRL_DOWN,  // RMS_NORM RMS_NORM CONCAT MUL_MAT                  : loop controller input
     GGML_CUDA_INKLING2_CTRL_OUT,   // MUL_MAT MUL_MAT TANH MUL SUB TANH MUL ADD         : loop controller output

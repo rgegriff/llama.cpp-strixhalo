@@ -3916,7 +3916,8 @@ struct test_inkling2 : public test_case {
     const int64_t    n_tok; // tokens
     const int64_t    k;     // CLIP: heads, CONV(_STATE, _DYN): sequences, SITU: experts used, MIX: states,
                             // CTRL: gate rank, RELBIAS and TABLE: heads
-    const int64_t    v;     // CLIP: has a scale, SITU: gathers the scale by expert id, MIX: queries, RELBIAS: n_kv,
+    const int64_t    v;     // CLIP: has a scale, SITU: gathers the scale by expert id (2: no scale), MIX: queries,
+                            // RELBIAS: n_kv,
                             // TABLE: bins of the bias (the relative extent),
                             // CONV_DYN: heads, CONV(_STATE): a residual add follows
 
@@ -4008,8 +4009,10 @@ struct test_inkling2 : public test_case {
                 const int64_t n_used = k;
                 ggml_tensor * gu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n, n_used, n_tok);
                 ggml_set_name(gu, "gate_up");
-                ggml_tensor * s;
-                if (v) {
+                ggml_tensor * s = nullptr;
+                if (v == 2) {
+                    // no per-expert scale: the views are taken on the expert output itself
+                } else if (v) {
                     ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
                     ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tok);
                     ggml_set_name(ids, "ids");
@@ -4021,7 +4024,9 @@ struct test_inkling2 : public test_case {
                 } else {
                     s = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tok);
                 }
-                gu = ggml_mul(ctx, gu, s);
+                if (s != nullptr) {
+                    gu = ggml_mul(ctx, gu, s);
+                }
                 ggml_tensor * gate = ggml_view_3d(ctx, gu, n, n_used, n_tok, gu->nb[1], gu->nb[2], 0);
                 ggml_tensor * up   = ggml_view_3d(ctx, gu, n, n_used, n_tok, gu->nb[1], gu->nb[2], n*ggml_element_size(gu));
                 const float beta = 4.0f;
@@ -12441,6 +12446,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2(test_inkling2::CONV, 2304, n_tok, 1, 1));
         test_cases.emplace_back(new test_inkling2(test_inkling2::SITU, 1152, n_tok, 8, 1));
         test_cases.emplace_back(new test_inkling2(test_inkling2::SITU, 1152, n_tok, 8, 0));
+        test_cases.emplace_back(new test_inkling2(test_inkling2::SITU, 1152, n_tok, 8, 2));
         for (int64_t n_states : { 2, 5, 9, 16 }) {
             for (int64_t n_q : { 1, 3, 4 }) {
                 test_cases.emplace_back(new test_inkling2(test_inkling2::MIX, 2304, n_tok, n_states, n_q));
