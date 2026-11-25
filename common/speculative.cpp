@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <random>
@@ -1407,7 +1408,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
 
         if (has_markov_context) {
-            ctx_rows = (size_t) block_size + 1;
+            // the ring holds the boundary state of every row of the last verify batch: an n-gram draft sharing this
+            // run can make that batch longer than a DSpark block, and the next DSpark draft reads the state at the
+            // last accepted position, which may be any of those rows
+            ctx_rows = (size_t) std::max<int32_t>(block_size, common_speculative_n_max(&params)) + 1;
             ctx_embd.resize((size_t) n_seq * ctx_rows * (size_t) n_embd_dec);
             ctx_pos.assign((size_t) n_seq * ctx_rows, -1);
             block_state.reserve((size_t) n_seq * block_size * n_embd_dec);
@@ -1449,7 +1453,7 @@ protected:
         if (!state) {
             return;
         }
-        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - (llama_pos) ctx_rows + 1);
         for (int32_t i = 0; i < n_chunk; ++i) {
             const llama_pos pos = batch_inject.tokens[i].pos[0];
             if (pos < pos_min) {
@@ -2898,7 +2902,37 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // hybrid n-gram + draft-model heuristics (env-gated, off by default)
+    struct hybrid_seq {
+        int32_t n_draft = 0;          // length of the draft sent to verification this step
+
+        // H1: rolling acceptance of the draft-model source over its last K steps
+        std::deque<std::pair<int32_t, int32_t>> dm_win; // (drafted, accepted)
+        int32_t dm_drafted  = 0;
+        int32_t dm_accepted = 0;
+
+        // H2: adaptive n-gram cap
+        int32_t ng_cap = 0;
+    };
+    std::vector<hybrid_seq> hyb;
+
+    int32_t h1_k      = 0;    // LLAMA_SPEC_HYB_DM_ADAPT=K,thr,n_short
+    float   h1_thr    = 0.0f;
+    int32_t h1_short  = 0;
+    int32_t h2_c0     = 0;    // LLAMA_SPEC_HYB_NG_GROW=c0,cmax
+    int32_t h2_cmax   = 0;
+    int32_t ng_cap    = 0;    // LLAMA_SPEC_HYB_NG_CAP=N: fixed n-gram cap
+
+    size_t  n_trunc_dm = 0;   // steps where H1 shortened a draft-model draft
+    size_t  n_trunc_ng = 0;   // steps where an n-gram draft was capped
 };
+
+static bool common_speculative_type_is_ngram(common_speculative_type t) {
+    return t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+           t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+           t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -3501,6 +3535,27 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    result->hyb.resize(n_seq);
+    if (const char * e = getenv("LLAMA_SPEC_HYB_DM_ADAPT")) {
+        if (sscanf(e, "%d,%f,%d", &result->h1_k, &result->h1_thr, &result->h1_short) != 3 || result->h1_k <= 0 || result->h1_short < 1) {
+            result->h1_k = 0;
+        }
+        SPC_INF("hybrid H1: draft-model rolling acceptance over %d steps < %.2f -> drafts cut to %d\n", result->h1_k, result->h1_thr, result->h1_short);
+    }
+    if (const char * e = getenv("LLAMA_SPEC_HYB_NG_GROW")) {
+        if (sscanf(e, "%d,%d", &result->h2_c0, &result->h2_cmax) != 2 || result->h2_c0 <= 0 || result->h2_cmax < result->h2_c0) {
+            result->h2_c0 = 0;
+        }
+        for (auto & h : result->hyb) {
+            h.ng_cap = result->h2_c0;
+        }
+        SPC_INF("hybrid H2: n-gram cap starts at %d, doubles on a fully accepted n-gram draft up to %d, resets on a rejection\n", result->h2_c0, result->h2_cmax);
+    }
+    if (const char * e = getenv("LLAMA_SPEC_HYB_NG_CAP")) {
+        result->ng_cap = std::max(0, atoi(e));
+        SPC_INF("hybrid: n-gram drafts capped at %d tokens\n", result->ng_cap);
+    }
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -3630,6 +3685,34 @@ void common_speculative_draft(common_speculative * spec) {
                     }
                 }
 
+                {
+                    auto & h = spec->hyb[seq_id];
+                    int32_t cap = -1;
+                    if (common_speculative_type_is_ngram(impl->type)) {
+                        if (spec->h2_c0 > 0) {
+                            cap = h.ng_cap;
+                        } else if (spec->ng_cap > 0) {
+                            cap = spec->ng_cap;
+                        }
+                        if (cap > 0 && (int32_t) result.size() > cap) {
+                            spec->n_trunc_ng++;
+                        }
+                    } else if (spec->h1_k > 0 && (int32_t) h.dm_win.size() >= spec->h1_k &&
+                               (float) h.dm_accepted < spec->h1_thr * (float) h.dm_drafted) {
+                        cap = spec->h1_short;
+                        if ((int32_t) result.size() > cap) {
+                            spec->n_trunc_dm++;
+                        }
+                    }
+                    if (cap > 0 && (int32_t) result.size() > cap) {
+                        result.resize(cap);
+                        if (dp.result_q && !dp.result_q->empty()) {
+                            dp.result_q->resize(cap);
+                        }
+                    }
+                    h.n_draft = (int32_t) result.size();
+                }
+
                 if (!result.empty()) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
                             common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
@@ -3689,6 +3772,24 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
+    }
+
+    if (seq_id < (llama_seq_id) spec->hyb.size()) {
+        auto & h = spec->hyb[seq_id];
+        if (common_speculative_type_is_ngram(impl->type)) {
+            if (spec->h2_c0 > 0) {
+                h.ng_cap = n_accepted >= h.n_draft ? std::min(spec->h2_cmax, 2*h.ng_cap) : spec->h2_c0;
+            }
+        } else if (spec->h1_k > 0) {
+            h.dm_win.emplace_back(h.n_draft, (int32_t) n_accepted);
+            h.dm_drafted  += h.n_draft;
+            h.dm_accepted += n_accepted;
+            while ((int32_t) h.dm_win.size() > spec->h1_k) {
+                h.dm_drafted  -= h.dm_win.front().first;
+                h.dm_accepted -= h.dm_win.front().second;
+                h.dm_win.pop_front();
+            }
+        }
     }
 
     // accept with the rest of the implementations, using is_other == true
@@ -3759,7 +3860,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        SPC_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
@@ -3768,5 +3869,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    if (spec->impls.size() > 1 || spec->h1_k > 0 || spec->h2_c0 > 0 || spec->ng_cap > 0) {
+        SPC_INF("hybrid: #trunc(draft-model H1) = %zu, #trunc(n-gram cap) = %zu\n", spec->n_trunc_dm, spec->n_trunc_ng);
     }
 }

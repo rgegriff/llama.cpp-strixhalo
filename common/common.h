@@ -17,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -424,7 +425,25 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // n-gram drafts on a recurrent/hybrid target: without per-position recurrent states a partial accept restores
+        // the pre-draft checkpoint and re-decodes the accepted tokens (replay). LLAMA_SPEC_NGRAM_RS=1 keeps rollback
+        // states for the longest n-gram draft too (the context clamps to 0 for models without rollback support)
+        uint32_t n_ngram = 0;
+        const char * e = getenv("LLAMA_SPEC_NGRAM_RS");
+        if (e && atoi(e) > 0) {
+            for (auto t : types) {
+                switch (t) {
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  n_ngram = std::max<uint32_t>(n_ngram, ngram_simple.size_m);  break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   n_ngram = std::max<uint32_t>(n_ngram, ngram_map_k.size_m);   break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n_ngram = std::max<uint32_t>(n_ngram, ngram_map_k4v.size_m); break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     n_ngram = std::max<uint32_t>(n_ngram, ngram_mod.n_max);      break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   n_ngram = std::max<uint32_t>(n_ngram, 8u);                   break;
+                    default: break;
+                }
+            }
+        }
+
+        return std::max<uint32_t>(needs_rs_seq ? (uint32_t) draft.n_max : 0u, n_ngram);
     }
 };
 
