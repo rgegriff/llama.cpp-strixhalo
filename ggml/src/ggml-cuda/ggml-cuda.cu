@@ -4026,6 +4026,15 @@ static bool ggml_cuda_topk_moe_group_fusion(const struct ggml_cgraph * cgraph, i
     return true;
 }
 
+// GGML_CUDA_TOPK_MOE_NORM_EPS=0 leaves the weight normalization with an offset sum (SCALE 1, eps) unfused
+static bool ggml_cuda_topk_moe_norm_eps_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_MOE_NORM_EPS");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -4033,6 +4042,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.norm_eps        = false;
     args.n_groups        = 0;
     args.n_group_used    = 0;
 
@@ -4154,14 +4164,25 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
     if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
         //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE
+        //the sum may be offset instead, RESHAPE->SUM_ROWS->SCALE(1, eps)->DIV->RESHAPE (expert_weights_norm_eps)
         static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP };
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
+            if (node_idx + 2 >= n_nodes) { // DIV and RESHAPE follow
+                args.norm     = false;
+                args.norm_eps = false;
+                return true;
+            }
             if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
+            } else if (op == GGML_OP_CLAMP && ggml_cuda_topk_moe_norm_eps_enabled() && nodes[node_idx]->op == GGML_OP_SCALE &&
+                       nodes[node_idx]->src[0] == nodes[node_idx - 1] && ggml_get_op_params_f32(nodes[node_idx], 0) == 1.0f) {
+                args.norm_eps = true;
+                node_idx++;
             } else {
-                args.norm = false;
+                args.norm     = false;
+                args.norm_eps = false;
                 return true;
             }
         }
@@ -4169,20 +4190,22 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         // DIV <- CLAMP, RESHAPE
         if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
-            args.norm = false;
+            args.norm     = false;
+            args.norm_eps = false;
             return true;
         }
         node_idx++;
 
         if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
-            args.norm = false;
+            args.norm     = false;
+            args.norm_eps = false;
             return true;
         }
 
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -4838,8 +4861,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ids = cgraph->nodes[out_nodes[0]];
 
                 if (args.norm) {
-                    ops.insert(ops.end(),
-                               { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_eps ? GGML_OP_SCALE : GGML_OP_CLAMP,
+                                            GGML_OP_DIV, GGML_OP_RESHAPE });
                     clamp = cgraph->nodes[i + ops.size() - 3];
                 }
                 if (args.scale) {
@@ -6117,8 +6140,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ids = cgraph->nodes[out_nodes[0]];
 
                         if (args.norm) {
-                            ops.insert(ops.end(),
-                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
+                                                    args.norm_eps ? GGML_OP_SCALE : GGML_OP_CLAMP, GGML_OP_DIV,
+                                                    GGML_OP_RESHAPE });
                         }
                         if (args.scale) {
                             ops.insert(ops.end(), { GGML_OP_SCALE });

@@ -14481,6 +14481,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // weights normalized by their sum plus an eps instead of the clamped sum (expert_weights_norm_eps)
+    for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID}) {
+        for (float scale_w : {0.0f, 2.0f}) {
+            for (int n_tok : {1, 8, 22}) {
+                test_cases.emplace_back(new test_topk_moe({128, n_tok, 1, 1}, 8, true, false, gate, scale_w, 1, true));
+            }
+        }
+    }
 
     // the sum is adjusted with an additive bias instead of a lower clamp (DeepSeek-V4.1)
     for (bool bias_probs : {false, true}) {
